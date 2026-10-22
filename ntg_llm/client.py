@@ -1,4 +1,4 @@
-"""Small OpenAI-style interface over the local router; not an HTTP API server."""
+"""Google-style generation and structured chat over the existing local router."""
 
 import json
 from pathlib import Path
@@ -9,6 +9,8 @@ from .settings import load_service
 from .errors import RoutingError
 from .schemas import Answer
 from .responses import ChatCompletion, CompletionChoice, CompletionMessage
+from .responses import GenerateContentResponse
+from .generation import generation_request
 
 _service = None
 _lock = threading.Lock()
@@ -59,14 +61,46 @@ class _ChatCompletions:
         )
 
 
+class _Models:
+    def __init__(self, service=None):
+        self._service = service
+
+    def generate_content(self, *, model, contents, config=None):
+        if not isinstance(model, str) or not model.strip():
+            raise RoutingError(400, "model must be a nonempty configured model name or router")
+        messages, response_model, options = generation_request(contents, config)
+        service = self._service if self._service is not None else _get_service()
+        result = service.generate_content(
+            model=model,
+            messages=messages,
+            response_model=response_model,
+            generation_options=options,
+        )
+        if response_model is not None:
+            payload = {"answer": result["answer"]} if response_model is Answer else result["data"]
+            parsed = response_model.model_validate_json(json.dumps(payload), strict=True)
+            text = parsed.model_dump_json()
+        else:
+            text = result["answer"]
+            parsed = json.loads(text) if options.get("response_format") else None
+        return GenerateContentResponse(
+            text=text,
+            parsed=parsed,
+            model_version=result["diagnostics"]["selected_model"],
+            diagnostics=result["diagnostics"],
+        )
+
+
 class LLMClient:
     """Credentials load lazily from .env; construction makes no provider calls.
 
-    Supports text-only, non-streaming completions through the router alias.
+    models.generate_content accepts Google-style text inputs and generation config.
+    chat.completions.create retains the existing structured completion interface.
     """
 
     def __init__(self, *, service=None):
         self.chat = SimpleNamespace(completions=_ChatCompletions(service))
+        self.models = _Models(service)
 
 
 # Backward-compatible name for existing application imports.

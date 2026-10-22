@@ -1,4 +1,4 @@
-"""The application makes exactly one completion call per valid prompt."""
+"""main.py is one routed Google-style generate_content call."""
 
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -9,50 +9,29 @@ import main
 from ntg_llm import LLMError
 
 
-@pytest.mark.parametrize("interactive", [False, True])
-def test_one_prompt_one_completion(monkeypatch, capsys, interactive):
-    create = Mock(
-        return_value=SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="Hello there"))]
-        )
+def test_one_generation_call(monkeypatch, capsys):
+    generate = Mock(return_value=SimpleNamespace(text="Generative AI creates new content."))
+    monkeypatch.setattr(
+        main,
+        "LLMClient",
+        lambda: SimpleNamespace(models=SimpleNamespace(generate_content=generate)),
     )
-    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
-    monkeypatch.setattr(main, "LLMClient", lambda: client)
-    monkeypatch.setattr("sys.argv", ["main.py"] if interactive else ["main.py", "Hello"])
-    monkeypatch.setattr("builtins.input", lambda: "Hello")
     main.main()
-    create.assert_called_once_with(messages=[{"role": "user", "content": "Hello"}])
-    assert capsys.readouterr().out == "Hello there\n"
+    generate.assert_called_once_with(
+        model="router", contents="Explain generative AI in one sentence."
+    )
+    assert capsys.readouterr().out == "Generative AI creates new content.\n"
 
 
-@pytest.mark.parametrize("prompt", ["", "   "])
-def test_blank_prompt_does_not_call_model(monkeypatch, prompt):
-    client = Mock()
-    monkeypatch.setattr(main, "LLMClient", client)
-    monkeypatch.setattr("sys.argv", ["main.py", prompt])
-    with pytest.raises(SystemExit) as error:
-        main.main()
-    assert error.value.code == 2
-    client.assert_not_called()
-
-
-def test_help_does_not_initialize_client(monkeypatch):
-    client = Mock()
-    monkeypatch.setattr(main, "LLMClient", client)
-    monkeypatch.setattr("sys.argv", ["main.py", "--help"])
-    with pytest.raises(SystemExit) as error:
-        main.main()
-    assert error.value.code == 0
-    client.assert_not_called()
-
-
-def test_provider_failure_remains_structured_without_an_extra_call(monkeypatch, capsys):
-    create = Mock(side_effect=LLMError(429, "Provider unavailable", retry_after=2))
-    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
-    monkeypatch.setattr(main, "LLMClient", lambda: client)
-    monkeypatch.setattr("sys.argv", ["main.py", "Hello"])
+def test_provider_error_remains_structured(monkeypatch, capsys):
+    generate = Mock(side_effect=LLMError(429, "Provider unavailable", retry_after=2))
+    monkeypatch.setattr(
+        main,
+        "LLMClient",
+        lambda: SimpleNamespace(models=SimpleNamespace(generate_content=generate)),
+    )
     with pytest.raises(SystemExit) as error:
         main.main()
     assert error.value.code == 1
-    create.assert_called_once()
+    generate.assert_called_once()
     assert '"status": 429' in capsys.readouterr().err

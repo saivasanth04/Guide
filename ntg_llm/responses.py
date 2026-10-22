@@ -31,3 +31,13 @@ class ChatCompletion(BaseModel, Generic[ResponseModel]):
     model: str
     choices: list[CompletionChoice[ResponseModel]]
     diagnostics: dict[str, Any]
+
+
+class GenerateContentResponse(BaseModel):
+    """Text-generation result with the actual routed model and safe diagnostics."""
+
+    model_config = ConfigDict(extra="forbid")
+    text: str
+    model_version: str
+    parsed: Any = None
+    diagnostics: dict[str, Any]

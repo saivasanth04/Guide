@@ -170,12 +170,24 @@ class CompletionService:
             normalized.append({"role": message["role"], "content": message["content"]})
         return self._run(normalized, response_model)
 
-    def _run(self, messages, response_model=Answer):
-        schema = response_schema(response_model)
+    def generate_content(self, *, model, messages, response_model=None, generation_options=None):
+        requested = model.removeprefix("models/")
+        deployments = (
+            self.deployments
+            if requested in ("router", "structured")
+            else [d for d in self.deployments if requested in (d.model, d.backend)]
+        )
+        if not deployments:
+            raise RoutingError(400, "Requested model is not in local routing configuration")
+        return self._run(messages, response_model, deployments, generation_options)
+
+    def _run(self, messages, response_model=Answer, deployments=None, generation_options=None):
+        schema = response_schema(response_model) if response_model is not None else None
+        deployments = self.deployments if deployments is None else deployments
         tried, attempts = set(), []
-        for _ in range(min(self.max_attempts, len(self.deployments))):
+        for _ in range(min(self.max_attempts, len(deployments))):
             try:
-                d = self.ledger.select(self.deployments, excluded=tried)
+                d = self.ledger.select(deployments, excluded=tried)
             except RoutingError as error:
                 if attempts:
                     error.diagnostics["attempts"] = attempts
@@ -197,7 +209,12 @@ class CompletionService:
                         last_error = error
                         break
                 try:
-                    result = self._complete_once(messages, d, response_model, schema)
+                    if generation_options is None:
+                        result = self._complete_once(messages, d, response_model, schema)
+                    else:
+                        result = self._complete_once(
+                            messages, d, response_model, schema, generation_options
+                        )
                 except RoutingError as error:
                     failure = {
                         **d.diagnostics,
@@ -229,15 +246,24 @@ class CompletionService:
                         },
                     ]
                     return result
-            if len(tried) >= min(self.max_attempts, len(self.deployments)):
+            if len(tried) >= min(self.max_attempts, len(deployments)):
                 last_error.diagnostics["attempts"] = attempts
                 raise last_error
 
-    def _complete_once(self, messages, d, response_model=Answer, schema=None):
-        schema = response_schema(response_model) if schema is None else schema
+    def _complete_once(
+        self, messages, d, response_model=Answer, schema=None, generation_options=None
+    ):
+        schema = (
+            response_schema(response_model)
+            if schema is None and response_model is not None
+            else schema
+        )
         token = self.strategy.selection.set(d)
         try:
-            if d.response_mode == "json_object":
+            options = dict(generation_options or {})
+            if response_model is None:
+                response_format = options.pop("response_format", None)
+            elif d.response_mode == "json_object":
                 response_format = {"type": "json_object"}
                 messages = [
                     {
@@ -261,12 +287,20 @@ class CompletionService:
             response = self.router.completion(
                 model="structured",
                 messages=messages,
-                response_format=response_format,
+                **({"response_format": response_format} if response_format is not None else {}),
                 num_retries=0,
                 max_retries=0,
                 fallbacks=[],
+                **options,
                 **provider_options,
             )
+            if response_model is None:
+                text = response.choices[0].message.content
+                if not isinstance(text, str) or not text.strip():
+                    raise ValueError("Provider returned no text")
+                if response_format is not None:
+                    json.loads(text)
+                return {"answer": text, "diagnostics": d.diagnostics}
             parsed = validate_response(response.choices[0].message.content, response_model, schema)
             payload = parsed.model_dump(mode="json")
             return {

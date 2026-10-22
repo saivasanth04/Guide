@@ -1,33 +1,68 @@
-# Single chat completion
+# Routed generation with a Google-style client interface
 
-Send one message through the existing provider-neutral client and print the answer.
-
-```powershell
-python -m pip install -e ".[dev]"
-python main.py
-```
-
-Or pass the message directly:
-
-```powershell
-python main.py "Explain Python lists briefly"
-```
-
-The application makes one completion-client call and exits. Provider routing,
-structured response validation, and existing upstream retry/fallback behavior stay
-inside the client. There are no agents, tool calls, project execution or repair loops.
+`main.py` is a single generation call:
 
 ```python
 from ntg_llm import LLMClient
 
-response = LLMClient().chat.completions.create(messages=[{"role": "user", "content": "Hello"}])
-print(response.choices[0].message.content)
+client = LLMClient()
+response = client.models.generate_content(
+    model="router",
+    contents="Explain generative AI in one sentence.",
+)
+print(response.text)
 ```
 
-Local credentials remain in `.env`; provider/model configuration remains in
-`llm.json` and `models.json`. `.env.example` and `llm.example.json` show the format.
-Existing local routing state is preserved in `router.sqlite3` and is not published.
-`diagnose.py` remains available for provider access diagnostics.
+Run `python main.py`. Edit `contents` to build your application directly; there is
+no command-line prompt, agent, tool loop or project executor.
 
-Run checks with `python -B -m pytest -p no:cacheprovider -q` and
-`python -m ruff check --no-cache .`.
+The public method has the same keyword argument names as Google's
+`client.models.generate_content(*, model, contents, config=None)`.
+The implementation uses our existing provider routing, credential pool, persistent
+rotation, retries and sanitized errors; it does not create a separate Google client.
+Credentials stay in `.env`, with provider/model settings in `llm.json` and `models.json`.
+
+- `model="router"` rotates across eligible configured deployments.
+- A specific model, such as `model="gemini-3.8-flash"`, rotates only among matching
+  configured deployments/keys. It never silently switches to another model.
+- `contents` accepts text, lists of text/text parts, and user/model Content dictionaries.
+  Native SDK text Content/Part objects are accepted when that SDK is installed.
+- `config` accepts a dictionary or native SDK GenerateContentConfig object.
+- `response.text` is the generated text; `response.model_version` identifies the
+  model actually used. Routing evidence remains in `response.diagnostics`.
+
+```python
+response = client.models.generate_content(
+    model="router",
+    contents="Explain generative AI in one sentence.",
+    config={
+        "system_instruction": "Answer clearly and briefly.",
+        "temperature": 0.2,
+        "max_output_tokens": 128,
+    },
+)
+print(response.text)
+```
+
+Supported generation settings: system_instruction, temperature, top_p, top_k,
+max_output_tokens, seed, stop_sequences, presence_penalty, frequency_penalty,
+and candidate_count=1. Settings are validated and forwarded to the selected
+provider; availability can still depend on that provider/model.
+
+For structured output, use response_mime_type="application/json" and optionally
+response_schema=YourPydanticModel. `response.parsed` then contains the validated
+model; without a schema it contains the decoded JSON value. Default text generation
+returns plain text directly and does not require an Answer JSON envelope.
+
+This facade currently covers synchronous text generation. Multimodal parts, tools,
+streaming, multiple candidates and other unsupported config fields are rejected;
+it is not a complete replacement for every Google SDK feature. Raw schema dicts
+and Google Schema objects are not supported as response_schema; use a named
+Pydantic model. The existing `client.chat.completions.create(...)` and
+`structured_completion(...)` APIs remain compatible.
+
+Install with `python -m pip install -e ".[dev]"`. Test with
+`python -B -m pytest -p no:cacheprovider -q` and
+`python -B -m ruff check --no-cache .`.
+
+Reference: [official Google Python SDK](https://github.com/googleapis/python-genai#generate-content).
