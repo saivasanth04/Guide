@@ -184,3 +184,53 @@ def test_cli_failure_after_write_reports_partial_effects(tmp_path, monkeypatch, 
     assert payload["diagnostics"]["tool_calls"][0]["path"] == "one"
     assert (root / "one").read_text() == "private"
     assert "private" not in output.err and "mock-secret" not in output.err
+
+
+def test_no_argument_terminal_prompts_for_task(tmp_path, monkeypatch, capsys):
+    service = CompletionService(deployments(), RotationStore(tmp_path / "state.db"), FakeRouter)
+    service.router.content = '{"code":"def square(n): return n*n","explanation":"Square."}'
+    monkeypatch.setattr(main, "LLMClient", lambda: LLMClient(service=service))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda: "Write a square function")
+    monkeypatch.setattr("sys.argv", ["main.py"])
+    main.main()
+    output = capsys.readouterr()
+    assert "Task:" in output.err
+    assert json.loads(output.out)["output"]["code"] == "def square(n): return n*n"
+    assert len(service.router.calls) == 1
+
+
+@pytest.mark.parametrize("response", ["", "  ", EOFError(), KeyboardInterrupt()])
+def test_empty_or_cancelled_prompt_never_calls_provider(monkeypatch, capsys, response):
+    monkeypatch.setattr(main, "LLMClient", lambda: pytest.fail("No provider call expected"))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+
+    def read():
+        if isinstance(response, BaseException):
+            raise response
+        return response
+
+    monkeypatch.setattr("builtins.input", read)
+    monkeypatch.setattr("sys.argv", ["main.py"])
+    with pytest.raises(SystemExit) as error:
+        main.main()
+    assert error.value.code == (130 if isinstance(response, BaseException) else 2)
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--entrypoint", "a.py"],
+        ["--max-repair-attempts", "0"],
+        ["--verify"],
+        ["--verify", "--workspace", ".", "--sandbox-image", "invalid", "--entrypoint", "a.py"],
+    ],
+)
+def test_incomplete_verification_args_fail_before_provider(monkeypatch, capsys, flags):
+    monkeypatch.setattr(
+        main, "LLMClient", lambda: pytest.fail("Invalid flags must not call provider")
+    )
+    monkeypatch.setattr("sys.argv", ["main.py", "Task", *flags])
+    with pytest.raises(SystemExit) as error:
+        main.main()
+    assert error.value.code == 2

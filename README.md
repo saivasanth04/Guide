@@ -1,7 +1,15 @@
-# Provider-neutral LLM abstraction — Milestone 6
+# Provider-neutral LLM abstraction — Milestone 9
 
 Application code uses one client regardless of whether Gemini, Groq, OpenRouter,
 or another configured LiteLLM provider supplies the answer.
+
+Milestone 9 adds a separate Tester role and sandbox-backed repair workflow.
+With `--verify`, the Coder writes project files, Docker executes the selected
+checks, the Tester turns failures into feedback, and LangGraph schedules at most
+three repairs by default. See [Milestone 9 usage and verification](docs/milestone9.md).
+Run `python main.py` in a terminal to enter a task interactively, or supply the task
+as an argument. The ready-to-run verified example is
+`.\examples\milestone9\run.ps1` after preparing Docker and the Python image.
 
 Milestone 6 uses a compiled LangGraph `StateGraph` to schedule model decisions,
 tool execution, and observation-driven continuation. The graph ends on a validated
@@ -62,7 +70,8 @@ Tool actions are never automatically retried or replayed by provider recovery.
 See [the current lifecycle and diagnostics](docs/milestone6.md) and
 [filesystem policy](docs/milestone5.md#workspace-policy).
 Without `--workspace` or a supplied registry, the Agent retains its tool-free
-behavior. No shell or generated-code execution is enabled.
+behavior. Generated-code execution is available only through the explicit
+Milestone 9 `--verify` Docker workflow; filesystem tools expose no shell.
 
 ## Agent interface
 
@@ -80,8 +89,9 @@ interface. `run(task, context=None)` returns an `AgentResult` with `agent_name`,
 typed `output`, selected `model`, and routing `diagnostics`. Runs keep their task
 and context isolated and delegate retries/fallback to the existing router.
 
-`main.py` invokes one Coder using a required task argument and optional `--context`
-text. `python main.py --help` displays usage; omitting the task exits with status 2.
+`main.py` accepts a task argument and optional `--context` text. In a terminal,
+omitting the task prompts for it. Noninteractive callers must supply a task.
+`python main.py --help` displays usage. Add `--verify` for the Tester/repair flow.
 The Coder returns nonblank `code` and `explanation` fields and checks Python source
 with `ast.parse`. In tool-free mode, source is returned without execution or file creation;
 parsing does not establish correctness. Invalid generated output returns a
@@ -207,6 +217,11 @@ ntg_llm/
     __init__.py           Public application API
     agent.py              Generic stateless Agent and typed AgentResult
     coder.py              First Coder role and Python output validation
+    project_workflow.py   Outer Coder -> sandbox -> Tester repair graph
+    sandbox.py            Bounded Docker execution and snapshot provenance
+    tester.py             Evidence-grounded Tester feedback
+    testing_models.py     Typed policy, execution and project results
+    testing_harness.py    Read-only trusted unittest harness
     tool_runtime.py       Compile/invoke the LangGraph ReAct graph
     langchain_model.py    NTGChatModel delegates model calls to LLMClient
     langchain_tools.py    Typed LangChain tools backed by the safe NTG registry

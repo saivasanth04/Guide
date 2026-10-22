@@ -1,6 +1,7 @@
 """UTF-8 filesystem capabilities bound to an explicit trusted local workspace."""
 
 import heapq
+import hashlib
 import os
 import re
 import stat
@@ -175,6 +176,43 @@ class FilesystemTools:
 
     def _relative(self, target):
         return target.relative_to(self.root).as_posix()
+
+    def snapshot(self, resource_paths, destination, *, max_files=1000, max_total_bytes=10485760):
+        """Copy checked UTF-8 Python/resources to a fresh host staging directory."""
+        destination = Path(destination).resolve()
+        if destination.is_relative_to(self.root) or self.root.is_relative_to(destination):
+            raise ToolError("path_denied")
+        resources = {self._relative(self._target(path)) for path in resource_paths}
+        manifest, total, visited = {}, 0, 0
+        pending = [self.root]
+        with self._lock, _filesystem_errors():
+            while pending:
+                parent = pending.pop()
+                for child in parent.iterdir():
+                    visited += 1
+                    if visited > max_files * 10:
+                        raise ToolError("too_large")
+                    if self._protected(child.name):
+                        continue
+                    name = self._relative(child)
+                    checked = self._target(name)
+                    info = checked.lstat()
+                    if stat.S_ISDIR(info.st_mode):
+                        pending.append(checked)
+                    elif stat.S_ISREG(info.st_mode) and (
+                        child.suffix.lower() == ".py" or name in resources
+                    ):
+                        data = self.read_file(PathArguments(path=name)).content.encode("utf-8")
+                        total += len(data)
+                        if len(manifest) >= max_files or total > max_total_bytes:
+                            raise ToolError("too_large")
+                        target = destination / name
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_bytes(data)
+                        manifest[name] = hashlib.sha256(data).hexdigest()
+            if not resources <= manifest.keys():
+                raise ToolError("not_found")
+        return dict(sorted(manifest.items()))
 
     def read_file(self, arguments: PathArguments) -> ReadData:
         with self._lock, _filesystem_errors():

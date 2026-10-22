@@ -113,14 +113,24 @@ def run_langgraph_agent(llm, messages, response_model, registry, max_tool_calls)
 
     def decide(state: _State):
         response = model.invoke(prompt.invoke({"agent_scratchpad": state["scratchpad"]}))
-        decision = _parse_action(response.content)
+        try:
+            decision = _parse_action(response.content)
+        except (ValueError, TypeError):
+            raise RoutingError(
+                502, "Agent returned invalid action JSON", {"code": "invalid_agent_action"}
+            ) from None
         name, arguments = decision["action"], decision["action_input"]
         if name == "Final Answer":
-            output = validate_response(
-                json.dumps(arguments, ensure_ascii=False),
-                response_model,
-                response_schema(response_model),
-            )
+            try:
+                output = validate_response(
+                    json.dumps(arguments, ensure_ascii=False),
+                    response_model,
+                    response_schema(response_model),
+                )
+            except Exception:
+                raise RoutingError(
+                    502, "Agent returned invalid final output", {"code": "invalid_final_output"}
+                ) from None
             return {"action": name, "output": output}
         if name not in by_name:
             raise RoutingError(

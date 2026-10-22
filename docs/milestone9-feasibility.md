@@ -1,7 +1,8 @@
 # Milestone 9 feasibility: Tester and bounded repairs
 
-Date: 2026-10-22. Scope: assessment and implementation plan; application behavior
-remains Milestone 6 until the plan is implemented and verified.
+Date: 2026-10-22. This document preserves the assessment before implementation.
+The implemented workflow and current verification results are in
+[current Milestone 9 usage](milestone9.md).
 
 ## Conclusion
 
@@ -30,8 +31,8 @@ filename nor a specific exception is a required product behavior.
 | Execution environment | Windows; Docker CLI installed | Docker Linux engine unavailable during checks |
 
 Read-only checks `docker version`, `docker info` and `docker image ls` all failed
-because `dockerDesktopLinuxEngine` was absent. Docker availability and images
-therefore cannot be claimed. A real sandbox test must run after a Linux Docker
+because `dockerDesktopLinuxEngine` was absent. At assessment time, Docker availability and images
+could not be claimed. A real sandbox test must run after a Linux Docker
 engine and a host-approved Python image become available. No service was started,
 image downloaded or generated code executed during this assessment.
 
@@ -138,3 +139,10 @@ See the [concrete implementation plan](../plan/feature-tester-milestone9-v1.md).
 
 Baseline cross-check on 2026-10-22: `python -m pytest -q` returned **218 passed,
 1 skipped** in 49.19 seconds. No production code changed during this assessment.
+
+Implementation follow-through: Docker startup was recovered by preserving stale
+runtime socket directories and restarting Desktop. The Linux engine and approved
+Python image became available. The implementation subsequently passed the full
+required-Docker suite (275 passed, one existing platform skip) and a real API
+Coder/Tester repair exercise with three passing checks after one repair. See
+[current results and commands](milestone9.md).

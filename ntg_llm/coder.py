@@ -47,6 +47,12 @@ CODER_TOOL_SYSTEM_PROMPT = _CODER_ROLE + (
     "You may inspect and write workspace files using registered tools. "
     "Only claim file actions confirmed by their observations. "
     "Do not execute generated code or claim it has been tested."
+    " Follow the runtime's action protocol for every response. To finish, put code and "
+    "explanation inside action_input of the Final Answer action; never return those fields "
+    "as a bare object. For example the inner action is "
+    '{"action":"Final Answer","action_input":{"code":"pass","explanation":"Done."}}. '
+    "Source strings must decode to actual Python source with real newline characters, "
+    "not literal backslash-n text."
 )
 
 
