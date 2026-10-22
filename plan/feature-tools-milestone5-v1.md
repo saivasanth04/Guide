@@ -12,6 +12,10 @@ tags: [feature, tools, agents, filesystem, milestone5]
 
 ![Status: Completed](https://img.shields.io/badge/status-Completed-brightgreen)
 
+Historical Milestone 5 implementation record. Its custom agent orchestration was
+replaced by the [LangChain migration](refactor-langchain-react-v1.md); the
+filesystem policy and host-tool implementation remain in use.
+
 Extend Milestone 4 with registered host-executed tools. The model requests actions
 using structured JSON, the application validates and performs them, and the model
 receives their results before returning its final typed output. Repository root:

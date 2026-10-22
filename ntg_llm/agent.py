@@ -11,7 +11,6 @@ from .client import LLMClient
 from .errors import RoutingError
 from .schemas import Answer, response_schema
 from .tools.registry import ToolRegistry
-from .tool_runtime import run_with_tools
 
 OutputT = TypeVar("OutputT", bound=BaseModel)
 
@@ -32,8 +31,8 @@ class Agent(Generic[OutputT]):
     """Configure a role once; each run supplies its own task and optional context.
 
     Construction validates configuration without loading credentials. Tool-free
-    runs make one client invocation; tools enable a completion-driven ReAct cycle
-    with a host-configured action ceiling.
+    runs make one client invocation; tools use LangChain's ReAct factory/executor.
+    max_tool_calls maps to the executor's single-action iteration limit.
     Upstream retries remain owned by the existing router.
     """
 
@@ -54,8 +53,6 @@ class Agent(Generic[OutputT]):
                 raise RoutingError(400, f"Agent {label} must be a nonempty string")
         try:
             response_schema(self.response_model)
-            if self.tools:
-                self.tools.build_decision_model(self.response_model)
         except RoutingError as error:
             raise self._with_identity(error) from None
 
@@ -86,7 +83,9 @@ class Agent(Generic[OutputT]):
         ]
         try:
             if self.tools:
-                outcome = run_with_tools(
+                from .tool_runtime import run_langchain_agent
+
+                outcome = run_langchain_agent(
                     self.llm, messages, self.response_model, self.tools, self.max_tool_calls
                 )
                 return AgentResult[self.response_model](

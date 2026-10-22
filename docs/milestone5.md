@@ -1,5 +1,10 @@
 # Milestone 5 — Agents with workspace tools
 
+Historical lifecycle record: the custom decision runtime described below was
+replaced by [LangChain ReAct in Milestone 6](milestone6.md). The workspace policy
+and registered filesystem handlers remain current. Use Milestone 6 for the
+current action protocol and iteration-limit semantics.
+
 The Agent can select a registered tool, supply typed arguments, observe its real
 result, and continue until it returns structured output. Tools are optional; the
 existing one-call, source-only Coder remains available when none are supplied.

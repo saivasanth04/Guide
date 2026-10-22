@@ -1,37 +1,56 @@
-# Milestone 6 — Structured ReAct agent loop
+# Milestone 6 — LangChain ReAct agent
 
-The tool-enabled Agent uses a ReAct-style cycle: assess the task and evidence,
-select one action, observe its actual result, then reassess until it returns a
-typed final answer. The model chooses the trajectory and when to finish.
+Tool-enabled runs use the actual `create_react_agent` and `AgentExecutor` from
+`langchain_classic.agents`. LangChain owns the ReAct lifecycle, including action
+parsing, tool dispatch, observations, scratchpad construction, and termination.
+NTG no longer implements its own action/final state machine or conversation loop.
 
 ```text
-Task + context + registered tools
-    -> private progress assessment
-    -> validated tool request -> execute once -> observation
-              ^                                  |
-              +---------- reassess ---------------+
-    -> validated final answer when ready
+Coder / Agent.run
+    -> LangChain create_react_agent + AgentExecutor.invoke
+        -> NTGChatModel -> LLMClient -> CompletionService
+            -> LiteLLM Router -> PersistentRoundRobin -> selected provider
+        -> LangChain StructuredTool -> ToolRegistry.execute -> FilesystemTools
+        -> LangChain scratchpad -> next model decision
+    -> strict final JSON validation -> AgentResult[CodeOutput]
 ```
 
-Milestone 5 supplied the tool registry, validated decisions, and observation
-transport. Milestone 6 adds an explicit ReAct policy, a completion-driven runtime,
-remaining-budget feedback, and acceptance tests that derive subsequent actions
-from observed data rather than merely advancing a scripted sequence.
+## API choice and pinned dependencies
 
-The [original ReAct paper](https://arxiv.org/abs/2210.03629) interleaves reasoning
-traces, actions, and observations. This project uses a structured adaptation:
-reasoning stays private, while actions and final output use the existing JSON
-schema. It does not reproduce the paper's explicit reasoning traces or benchmarks.
-Prompting specifies intended model behavior; offline tests cannot establish that
-a live model actually reasons well or reliably completes arbitrary tasks.
+Checked on 2026-10-22 using official documentation, PyPI metadata, and installed
+source: the environment originally had LangChain 1.3.1, core 1.4.0, classic 1.0.7,
+and LangGraph 1.2.0. The latest stable releases returned by PyPI were LangChain
+1.4.7, core 1.6.13, classic 1.0.8, and LangGraph 1.2.16.
 
-## Run the agent
+Modern LangChain recommends `langchain.agents.create_agent` for native tool-calling
+models. NTG's current client supports schema-validated text completions, with
+system/user/assistant messages, rather than native tool calls. The classic API
+provides the requested real ReAct executor while preserving that transport and
+every existing provider adapter. It is an older API; its own documentation
+recommends modern `create_agent` for new production agents. This choice is a
+deliberate compatibility tradeoff, not a claim that classic is the newest API.
 
-Create a directory containing only files intended for the model, then enable tools:
+Direct dependencies added:
+
+```text
+langchain-classic==1.0.8
+langchain-core==1.6.13
+```
+
+No `langchain-openai` or new provider integration is required. No LangGraph
+multi-agent orchestration is added. Transitive official dependencies are resolved
+by pip. Install the project with `python -m pip install -e ".[dev]"`.
+
+Sources: [official migration guide](https://docs.langchain.com/oss/python/migrate/langchain-v1),
+[classic package](https://pypi.org/project/langchain-classic/1.0.8/),
+[official factory source](https://github.com/langchain-ai/langchain/blob/master/libs/langchain/langchain_classic/agents/react/agent.py),
+[official JSON action parser](https://github.com/langchain-ai/langchain/blob/master/libs/langchain/langchain_classic/agents/output_parsers/json.py).
+
+## Use the existing public API
 
 ```powershell
 New-Item -ItemType Directory -Force .\agent_workspace
-python main.py "Inspect the workspace and create a Python whitespace-normalization helper" --workspace .\agent_workspace --max-tool-calls 8
+python main.py "Inspect the files and implement the requested Python helper" --workspace .\agent_workspace --max-tool-calls 8
 ```
 
 ```python
@@ -41,100 +60,145 @@ from ntg_llm import LLMClient, create_coder_agent, create_filesystem_registry
 workspace = Path("agent_workspace")
 workspace.mkdir(exist_ok=True)
 coder = create_coder_agent(
-    LLMClient(),
+    llm=LLMClient(),
     tools=create_filesystem_registry(workspace),
     max_tool_calls=8,
 )
-result = coder.run("Inspect existing files and implement a Python helper")
+result = coder.run("Find the greeting module and update the greeting")
 print(result.output.code)
 print(result.output.explanation)
 print(result.diagnostics["tool_calls"])
 ```
 
-Normal runs call configured providers. No-tools runs retain the existing
-single-completion behavior. Existing `Agent`, `AgentResult`, Coder output, and CLI
-interfaces remain compatible. See [Milestone 5](milestone5.md) for filesystem
-permissions, overwrite policy, payload bounds, and custom tool registration.
+Replacing existing files still requires both host `allow_overwrite=True` (CLI
+`--allow-overwrite`) and a selected write with `overwrite=true`. Normal CLI runs
+call configured providers. Tests use fake providers and temporary workspaces.
 
-## ReAct and termination
+## Model and tool adapters
 
-Each decision has `action`, nullable `tool`, and nullable `output`. A tool decision
-contains one registered name and typed arguments; a final decision contains the
-validated output contract. The host executes only accepted tool decisions.
+`NTGChatModel` implements LangChain's `BaseChatModel._generate`. It converts text
+messages, calls the same `LLMClient.chat.completions.create(model="router", ...)`,
+and returns a LangChain `AIMessage`. It does not choose providers, keys, accounts,
+or models, and adds no retry/fallback policy. Model caching and streaming are
+disabled. Provider retries remain inside each NTG completion call.
 
-The system instruction asks the model to assess evidence privately, use tools
-when useful, revise its choice after observations or errors, and finish when it
-has enough evidence. The runtime retains each assistant decision and its result
-in local history. Observations use this envelope:
+The existing `Answer` schema is only a transport envelope: `answer` carries ReAct
+text for LangChain's parser. A tool action uses the official parser's format:
 
+````text
+Action:
 ```json
-{
-  "type": "tool_result",
-  "result": {
-    "call_id": "tool_001",
-    "tool": "read_file",
-    "ok": false,
-    "data": null,
-    "error": {
-      "code": "not_found",
-      "message": "The requested workspace entry does not exist"
-    }
-  },
-  "remaining_tool_calls": 7
-}
+{"action":"read_file","action_input":{"path":"module.py"}}
 ```
+````
 
-The remaining count comes from the host, outside the tool's result data. For
-example, after a missing-file observation the model can list the directory,
-choose a discovered file, and read it before deciding how to proceed. The host
-does not preselect that recovery sequence.
+A final response uses the same official JSON protocol:
+`{"action":"Final Answer","action_input":{"code":"...","explanation":"..."}}`.
+LangChain's official `JSONAgentOutputParser` parses this text. Its
+dictionary `action_input` supports multi-field tools such as `write_file`.
+NTG does not implement a Thought/Action parser. The prompt contains `{tools}`,
+`{tool_names}`, `{agent_scratchpad}`, and `{input}`; the official factory renders
+the scratchpad from its intermediate steps. The prompt requests private progress
+assessment and emits no reasoning transcript.
 
-`max_tool_calls` is an execution ceiling, not a requested action count. With N,
-the model may finish immediately or after any of at most N tool attempts. Failed
-attempts count too. After the last attempt, one more decision can return final
-output, including an honest explanation of incomplete work. Another tool request
-is rejected with status 508 and `tool_limit_reached` before it executes. Thus
-there are at most N+1 model decision invocations; provider retries can add HTTP
-attempts within an invocation. ReAct itself does not guarantee termination.
+Intermediate actions are not `CodeOutput`. After LangChain returns `AgentFinish`,
+NTG strictly validates the final object against the caller's response model,
+including extra/missing fields, types, and Coder syntax checks.
+Invalid final output returns a sanitized 502 without an output-repair retry.
+Using LangChain's JSON action parser also keeps literal strings such as
+`Final Answer:` inside Python source from being interpreted as protocol delimiters.
+LangChain parses the protocol JSON; its permissive parser can normalize malformed
+JSON or select the first entry of a returned list. NTG validates the resulting
+object, but does not claim to apply its direct API's duplicate-key detection to
+the original inner action text. Its unsafe full-response parser warning is suppressed.
 
-Expected tool errors are observations. Malformed model decisions, provider
-failures after router recovery, and unexpected handler failures terminate with
-sanitized errors. Completed writes remain on disk if a later turn fails; action
-summaries remain in diagnostics. Provider retries never automatically replay
-prior tool actions. Tool results are untrusted user-message data, not system
-instructions. There is no native function-call transport or free-text action
-parser.
+`create_langchain_tools` exposes registry entries as `StructuredTool` instances
+with closed JSON argument schemas derived from their Pydantic models. LangChain
+dispatches the selected tool; its wrapper delegates to `ToolRegistry.execute`.
+The registry validates the original arguments before calling any handler. JSON
+schemas prevent LangChain from coercing types or inserting defaults ahead of that
+strict host validation. Expected errors become typed JSON observations; unknown
+tools stop before dispatch. Existing filesystem protections are unchanged:
+workspace scoping, protected credentials/state paths, link restrictions, payload
+bounds, and explicit overwrite policy. This is a trusted-workspace boundary, not
+an OS sandbox against another process racing filesystem links or arbitrary custom
+host handlers. See [filesystem policy](milestone5.md#workspace-policy).
 
-The final output is the model's completion signal, not independent verification
-of correctness. The Python Coder checks final source syntax; it cannot execute or
-test generated code with the current tool set. No reasoning transcript or file
-contents are added to diagnostics. Histories and action IDs reset on each run.
+## One execution ceiling
+
+`max_tool_calls=N` maps directly to `AgentExecutor.max_iterations=N`. The selected
+official parser returns one action per decision, so at most N tools can execute.
+The final decision also occupies an iteration. For three actions plus a final
+answer, configure at least four iterations. Failed actions consume iterations.
+The model can return an immediate final answer, including with a limit of one.
+
+If the executor exhausts its iterations, its `early_stopping_method="force"`
+stops the run; NTG converts that stop into a controlled 508 with
+`code="tool_limit_reached"`. No over-limit action is requested or executed.
+There is no independent NTG budget counter or automatically added final turn.
+This intentionally replaces the old N-tools-plus-one-final-turn behavior.
+
+Parsing recovery and executor-level retries are disabled. A provider retry
+retries only the current model completion; already-completed tools cannot replay
+through that path. The model can explicitly choose another write as a new action,
+which is subject to the usual overwrite policy. There is no crash-resume or
+exactly-once guarantee across restarts. Earlier writes remain if a later call
+fails; diagnostics retain completed-action summaries and uncertain effects.
+
+## Diagnostics and privacy
+
+`AgentResult` retains `agent_name`, typed `output`, selected `model`, and
+`diagnostics`. Per-run evidence includes:
+
+- `agent_runtime`: `langchain-classic.AgentExecutor`.
+- `agent_steps` and `agent_step_count`: NTG completion invocations, including final
+  decisions and failed model calls, with each invocation's routing diagnostics.
+- `attempts`, `failed_attempts`, `attempt_count`: aggregated upstream attempts
+  tagged with turn numbers; retries can increase attempts without adding actions.
+- `tool_calls`: host-assigned IDs, registered names, status/error codes, safe
+  relative paths, and byte/entry counts. Expected failures are recorded too.
+
+Diagnostics omit prompts, file contents, full argument objects, action logs,
+scratchpads, and private reasoning. `verbose=False` and disabled LangSmith tracing
+prevent the executor from printing or uploading trajectories. Parser exceptions
+can contain raw model output; NTG converts these to fixed errors. Provider
+`RoutingError` status, retry timing, and recovery flags remain intact.
+
+Runs create fresh executor/model/trace instances and share only immutable
+configuration and the existing client/registry. Direct completion APIs and agents
+without tools bypass the executor entirely, including lazy framework imports.
 
 ## Verification
 
-New tests traverse the real client, service, schema validation, registry, and
-temporary filesystem using an observation-aware fake provider. They cover:
+`tests/test_tool_agent.py` instruments the real factory, executor invocation,
+typed tools, model adapter, and real temporary filesystem writes. It verifies
+list/read/write/final flow, observation-dependent filenames and content, recovery,
+single authoritative bounds, strict final validation, retries without replay,
+partial effects, generic output schemas, and concurrent/sequential isolation.
+`tests/test_langchain_model.py` checks routing delegation, strict tool arguments,
+unsupported model features, and direct APIs without the executor.
 
-- Reading a filename from an observation, copying unique observed content, and
-  deriving the final explanation from the confirmed write result in both response modes.
-- Recovering from a missing input through observed directory entries and contents.
-- Completion after zero, one, or three actions with the same ceiling of three.
-- Sequential reuse of one Agent with isolated histories and reset call IDs.
-- A failed last action, zero remaining budget, and an honest incomplete final answer.
-
-Existing coverage checks over-budget rejection, malformed decisions, safe traces,
-provider retries without action replay, partial effects, and concurrent isolation.
-All tests block live HTTP and use temporary state. Live provider competence and
-provider-specific schema support have not been verified by these tests.
+The greeting E2E test discovers a uniquely named Python file, reads it, replaces
+its greeting with `Hello from ReAct`, writes through the existing handler, and
+reports the observed modified path. Assertions verify executor -> model ->
+existing router -> filesystem -> scratchpad -> model -> typed final output.
+This uses the actual LangChain runtime and a fake provider, not a fake executor.
+No live model judgment or universal provider compatibility is claimed.
 
 Run `python -m pytest -q`, `python -m ruff check .`,
 `python -m ruff format --check .`, and `python main.py --help`.
 
-Verified on 2026-10-22: **203 passed, 1 skipped** in 59.52 seconds. The focused
-tool-agent suite passed all 25 tests. Ruff lint and formatting checks passed;
-CLI help passed and describes the tool-attempt ceiling. The native-symlink test
-was skipped because this Windows host cannot create the link; separate hard-link
-and reparse-point checks passed. No live provider calls were made.
+Verified on 2026-10-22: the complete suite passed **209 tests, with one skipped**
+in 227.89 seconds. Ruff lint/format and CLI help passed. The requested greeting
+E2E was then run separately and passed in 96.61 seconds:
+`python -m pytest -q tests/test_tool_agent.py::test_e2e_greeting_edit_uses_real_langchain_and_router`.
+The native-symlink test is skipped because this Windows host cannot create the
+link; separate reparse/hard-link tests passed. Four import warnings originate from
+optional CUDA/SWIG/community packages already installed on this machine; those
+integrations are not project dependencies. No live provider requests were made.
+The privacy test was also rerun separately with spies on LangSmith SDK upload
+methods; it passed and recorded no create/update upload calls under enabled
+outer tracing. Agent execution overrides that outer tracing context to disabled.
 
-See the [feasibility study](milestone6-feasibility.md) and
-[implementation plan](../plan/feature-agent-loop-milestone6-v1.md).
+The [feasibility assessment](milestone6-feasibility.md) and
+[migration plan](../plan/refactor-langchain-react-v1.md) record the architecture.

@@ -4,13 +4,17 @@ version: 2.0
 date_created: 2026-10-22
 last_updated: 2026-10-22
 owner: NTG
-status: Completed
+status: Deprecated
 tags: [feature, agent-loop, milestone6, verification]
 ---
 
 # Introduction
 
-![Status: Completed](https://img.shields.io/badge/status-Completed-brightgreen)
+![Status: Deprecated](https://img.shields.io/badge/status-Deprecated-red)
+
+Historical completed implementation, superseded by the user-requested
+[LangChain runtime migration](refactor-langchain-react-v1.md). Its custom-loop
+architecture and extra-final-turn semantics no longer describe current behavior.
 
 Milestone 5 supplies the tools and feedback transport. The user authorized a
 ReAct feasibility study followed by implementation. Version 2 replaces the earlier

@@ -1,5 +1,8 @@
 # Milestone 5 feasibility assessment
 
+Historical assessment. The original NTG-owned loop was subsequently removed;
+[Milestone 6](milestone6.md) now uses the real LangChain factory and executor.
+
 Status: assessment completed before implementation. The approved plan is now
 implemented; see [Milestone 5](milestone5.md) for current usage and verification.
 The assessment below records the original Milestone 4 baseline.

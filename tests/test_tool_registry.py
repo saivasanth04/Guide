@@ -3,11 +3,9 @@
 from unittest.mock import Mock
 
 import pytest
-from pydantic import BaseModel, ConfigDict, StrictStr, ValidationError
-from jsonschema import ValidationError as SchemaValidationError
+from pydantic import BaseModel, ConfigDict, StrictStr
 
 from ntg_llm.errors import RoutingError
-from ntg_llm.schemas import Answer, response_schema, validate_response
 from ntg_llm.tools.models import ToolError, ToolSpec
 from ntg_llm.tools.registry import ToolRegistry
 
@@ -35,17 +33,11 @@ def spec(handler=None, name="echo"):
 def test_dispatch_and_catalog_are_typed_and_side_effect_free():
     handler = Mock(return_value=Result(result="hi"))
     registry = ToolRegistry([spec(handler)])
-    decision = registry.build_decision_model(Answer)
-    schema = response_schema(decision)
-    assert schema["additionalProperties"] is False
     assert registry.catalog()[0]["name"] == "echo"
-    parsed = validate_response(
-        '{"action":"tool","tool":{"name":"echo","arguments":{"value":"hi"}},"output":null}',
-        decision,
-        schema,
-    )
+    assert registry.catalog()[0]["input_schema"]["additionalProperties"] is False
+    assert registry.specs[0].name == "echo"
     handler.assert_not_called()
-    result = registry.execute(parsed.tool.name, parsed.tool.arguments, call_id="tool_001")
+    result = registry.execute("echo", {"value": "hi"}, call_id="tool_001")
     assert result.ok and result.data.result == "hi"
     assert result.error is None
     assert handler.call_count == 1
@@ -82,22 +74,12 @@ def test_unknown_tool_never_executes_anything():
     handler.assert_not_called()
 
 
-@pytest.mark.parametrize(
-    "payload",
-    [
-        '{"action":"tool","tool":null,"output":null}',
-        '{"action":"final","tool":null,"output":null}',
-        '{"action":"final","tool":{"name":"echo","arguments":{"value":"x"}},"output":{"answer":"x"}}',
-        '{"action":"tool","tool":{"name":"unknown","arguments":{"value":"x"}},"output":null}',
-    ],
-)
-def test_invalid_decisions_never_execute(payload):
-    handler = Mock()
-    registry = ToolRegistry([spec(handler)])
-    decision = registry.build_decision_model(Answer)
-    with pytest.raises((ValueError, ValidationError, SchemaValidationError)):
-        validate_response(payload, decision, response_schema(decision))
-    handler.assert_not_called()
+def test_specs_are_immutable_and_no_custom_agent_schema_remains():
+    registry = ToolRegistry([spec()])
+    assert isinstance(registry.specs, tuple)
+    assert not hasattr(registry, "build_decision_model")
+    with pytest.raises((AttributeError, TypeError)):
+        registry.specs[0] = spec(name="replacement")
 
 
 def test_expected_errors_are_fixed_observations_and_unexpected_errors_stop():

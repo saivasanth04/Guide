@@ -3,10 +3,11 @@
 Application code uses one client regardless of whether Gemini, Groq, OpenRouter,
 or another configured LiteLLM provider supplies the answer.
 
-Milestone 6 gives the tool-enabled Agent an explicit ReAct-style cycle: assess
-the task, act through registered tools, observe results, and reassess until final
-output. The model chooses when to finish; a configurable ceiling bounds tool
-attempts. See [Milestone 6 usage](docs/milestone6.md).
+Milestone 6 uses LangChain's actual `create_react_agent` and `AgentExecutor` from
+the pinned `langchain-classic` package. LangChain owns tool selection, execution,
+observations, scratchpad history, and termination. An `NTGChatModel` adapter sends
+every model call through the existing NTG client and router.
+See [Milestone 6 architecture and usage](docs/milestone6.md).
 One Python Coder can read, write, and list files, then return validated structured
 output. See [Milestone 5 tool policy](docs/milestone5.md).
 The [tool-free Agent](docs/milestone4.md) and
@@ -37,21 +38,29 @@ print(result.model_dump_json(indent=2))
 ```
 
 The model selects a registered `read_file`, `write_file`, or `list_files` request.
-Python validates and executes it, then feeds the result back for the next decision.
+LangChain dispatches a typed tool whose NTG handler validates and executes it;
+LangChain then incorporates the observation into its scratchpad.
 Files are scoped to the explicit workspace. Protected credential/state paths,
 traversal, and filesystem links are rejected. Replacement requires host
 `--allow-overwrite` and a tool request with `overwrite=true`.
 
-`--max-tool-calls` defaults to a ceiling of 8; the agent may finish earlier.
-Observations include the remaining tool attempts so it can adapt or report
-incomplete work. Filesystem payload/list bounds are configurable
+`--max-tool-calls` maps to `AgentExecutor.max_iterations` and defaults to 8.
+The official single-action parser permits one tool per iteration; the final
+decision also occupies an iteration. A run needing three tools plus a final
+answer requires at least four iterations. Exhaustion returns a sanitized 508;
+there is no separate NTG action counter or extra final turn.
+Filesystem payload/list bounds are configurable
 host policy, separate from provider quotas. Successful actions appear in
 `diagnostics.tool_calls`; model turns and upstream failures appear in
-`agent_steps`, `attempts`, and `failed_attempts`. Traces omit file contents.
+`agent_steps`, `agent_step_count`, `attempts`, and `failed_attempts`.
+Diagnostics identify `agent_runtime` as `langchain-classic.AgentExecutor`.
+Traces omit file contents, scratchpads, and model reasoning. Verbose executor
+logging and LangSmith tracing are disabled for agent execution.
 If a later turn fails, earlier writes remain and are reported in error diagnostics.
 Tool actions are never automatically retried or replayed by provider recovery.
 
-See [the complete tool lifecycle, policy, and diagnostics](docs/milestone5.md).
+See [the current lifecycle and diagnostics](docs/milestone6.md) and
+[filesystem policy](docs/milestone5.md#workspace-policy).
 Without `--workspace` or a supplied registry, the Agent retains its tool-free
 behavior. No shell or generated-code execution is enabled.
 
@@ -198,7 +207,10 @@ ntg_llm/
     __init__.py           Public application API
     agent.py              Generic stateless Agent and typed AgentResult
     coder.py              First Coder role and Python output validation
-    tool_runtime.py       Completion-driven ReAct cycle with a host action ceiling
+    tool_runtime.py       Construct/invoke LangChain ReAct agent and executor
+    langchain_model.py    NTGChatModel delegates model calls to LLMClient
+    langchain_tools.py    Typed LangChain tools backed by the safe NTG registry
+    agent_trace.py        Sanitized per-run routing and action evidence
     tools/                Typed registry, tool models, workspace filesystem policy
     client.py             OpenAI-style facade and lazy service construction
     schemas.py            Pydantic contracts and strict JSON validation

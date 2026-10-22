@@ -26,7 +26,7 @@ def main():
         "--max-tool-calls",
         type=int,
         default=8,
-        help="Tool attempt safety ceiling; the agent may finish earlier (default: 8)",
+        help="LangChain single-action iteration ceiling, including final decision (default: 8)",
     )
     args = parser.parse_args()
     if args.allow_overwrite and args.workspace is None:

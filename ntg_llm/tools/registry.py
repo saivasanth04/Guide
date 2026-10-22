@@ -1,29 +1,16 @@
-"""Immutable registration, closed decision schemas, and explicit tool execution."""
+"""Immutable host registration, strict argument validation, and safe tool execution."""
 
 import json
 import re
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Literal, Union
 
-from pydantic import BaseModel, ConfigDict, ValidationError, create_model, model_validator
+from pydantic import BaseModel, ValidationError
 from jsonschema import ValidationError as SchemaValidationError
 
 from ..errors import RoutingError
 from ..schemas import response_schema, validate_response
 from .models import ToolError, ToolFailure, ToolResult, ToolSpec
-
-
-class _Decision(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    @model_validator(mode="after")
-    def check_action(self):
-        if self.action == "tool" and self.tool is not None and self.output is None:
-            return self
-        if self.action == "final" and self.tool is None and self.output is not None:
-            return self
-        raise ValueError("Select exactly one tool action or final output")
 
 
 @dataclass(frozen=True, init=False)
@@ -61,29 +48,10 @@ class ToolRegistry:
             for s in self._specs.values()
         ]
 
-    def build_decision_model(self, final_model):
-        response_schema(final_model)
-        if not self:
-            raise RoutingError(400, "A tool decision requires a nonempty registry")
-        calls = [
-            create_model(
-                f"ToolCall_{s.name}",
-                __config__=ConfigDict(extra="forbid"),
-                name=(Literal[s.name], ...),
-                arguments=(s.input_model, ...),
-            )
-            for s in self._specs.values()
-        ]
-        tool_type = Union[tuple(calls)]
-        decision = create_model(
-            "AgentDecision",
-            __base__=_Decision,
-            action=(Literal["tool", "final"], ...),
-            tool=(tool_type | None, ...),
-            output=(final_model | None, ...),
-        )
-        response_schema(decision)
-        return decision
+    @property
+    def specs(self):
+        """Read-only registrations for host adapters; no model-side decision schema."""
+        return tuple(self._specs.values())
 
     def execute(self, name, arguments, *, call_id):
         spec = self._specs.get(name) if isinstance(name, str) else None

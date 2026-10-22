@@ -1,127 +1,97 @@
-# Milestone 6 feasibility assessment
+# Milestone 6 — LangChain migration feasibility
 
-Date: 2026-10-22. Status: ReAct feasibility assessed; implementation completed and verified.
+Date: 2026-10-22. Status: implemented and verified.
 
-## ReAct reassessment
+## Assessment before implementation
 
-The user requested ReAct and authorized proceeding after feasibility study.
-The [original ReAct paper](https://arxiv.org/abs/2210.03629) interleaves reasoning,
-actions, and environment observations to revise a task trajectory. This is
-compatible with the existing structured decisions and host-owned tools.
+The repository's prior runtime was an NTG-owned loop in `tool_runtime.py`.
+`ToolRegistry.build_decision_model` generated custom `action=tool/final` contracts;
+`run_with_tools` executed actions, inserted observations, and selected the next
+model decision. It was a ReAct-inspired implementation, not a LangChain agent.
+The previous verification-only/explicit-prompt milestone plans are superseded by
+the user's request for LangChain ownership.
 
-The previous `for` loop was already a ceiling, not a predetermined action plan.
-ReAct governs action selection; it does not itself guarantee eventual termination.
-Use a completion-driven `while` loop with explicit ReAct instructions, keeping
-the existing configurable maximum as a separate guard against stalled execution.
-The model can finish immediately or after any observation. When no tool calls
-remain, allow a final answer that honestly reports incomplete work; reject any
-additional action before execution with the existing 508 error.
+The existing router stack is ready to serve as the backend: `LLMClient` delegates
+to `CompletionService`, which owns round-robin selection, provider retries,
+fallback, and sanitized errors. The interface supports structured text responses,
+not native provider function calls. Filesystem handlers and strict registry
+validation can be reused unchanged beneath LangChain tools.
 
-Implement a ReAct-style adaptation: privately assess progress and missing evidence,
-select one typed action, observe its actual result, then revise the next choice.
-Do not collect verbose reasoning traces or parse free-text Thought/Action labels.
-This differs from the paper's explicit reasoning-trace demonstrations; it is not
-a reproduction of its experiments or evidence of equivalent performance.
+## Verified API selection
 
-Feasibility cross-check: `run_with_tools` already retains assistant decisions and
-tool observations; `ToolRegistry` already validates actions; provider recovery
-already surrounds each decision rather than replaying side effects. No SDK,
-schema migration, provider capability change, or new dependency is needed. Add
-the host-owned remaining-action count to each observation and state the initial
-ceiling in the system instruction. Keep current public APIs and tool-free mode.
+Installed versions were LangChain 1.3.1, core 1.4.0, classic 1.0.7, and LangGraph
+1.2.0. PyPI reported latest stable versions 1.4.7, 1.6.13, 1.0.8, and 1.2.16,
+respectively. Official docs recommend `langchain.agents.create_agent` for modern
+native tool-calling models. The exact requested `create_react_agent` and
+`AgentExecutor` remain available under `langchain_classic.agents`.
 
-Alternatives considered: a framework/native-tool migration adds unnecessary
-adapter work; unbounded execution removes the only deterministic stop for a model
-that keeps selecting tools; a free-text ReAct parser weakens the existing typed
-contract. The structured ReAct adaptation is the smallest compatible option.
+Select and pin `langchain-classic==1.0.8` plus `langchain-core==1.6.13` for this
+text-only router. The official classic factory accepts a custom prompt and an
+official `JSONAgentOutputParser`, supporting dictionary action inputs
+for typed multi-field writes. Set `stop_sequence=False` because the current NTG
+client does not expose provider stop sequences. Use a nonstreaming runnable agent.
 
-Validate with observation-dependent copying, corrective missing-file recovery,
-different completion lengths, final-at-limit behavior, and sequential isolation
-through the real service/validation/tool stack. Mock providers can establish these
-host mechanics but cannot establish improved live model reasoning or success rates.
+This is the older classic implementation; its official source recommends modern
+`create_agent` for new production applications. It is selected for compatibility,
+not presented as modern LangChain's preferred API. A modern native-call migration
+would additionally need `bind_tools`, native tool-message support, provider
+capability handling, and structured-output strategy changes beyond this task's
+preserved text contract.
 
-## Milestone interpretation
+Checked sources: [official migration guide](https://docs.langchain.com/oss/python/migrate/langchain-v1),
+[PyPI classic metadata](https://pypi.org/pypi/langchain-classic/json),
+[PyPI core metadata](https://pypi.org/pypi/langchain-core/json), and installed official
+factory, executor, tool, and JSON parser source for the pinned releases.
 
-The required behavior is repeated model decision -> host tool execution -> model
-observation -> next decision, terminating with a validated final answer or a
-bounded failure. The illustrative while loop is not an API specification.
-Neither a literal `tool` message role nor native provider function calling is
-required. Internal model reasoning does not need to be exposed or stored.
+## Responsibility cross-check
 
-## Findings cross-checked against source and tests
-
-| Required behavior | Current implementation | Existing evidence |
+| Responsibility | Before | After |
 |---|---|---|
-| Start from the caller's task | `Agent.run` constructs isolated task/context messages | `tests/test_agent.py`, `tests/test_tool_agent.py` |
-| Ask the model for its next decision repeatedly | `run_with_tools` requests a schema-validated decision on each turn | `test_write_list_read_and_final_preserve_feedback_and_safe_traces` |
-| Select and execute a registered tool | `ToolRegistry.build_decision_model` and `execute` validate and dispatch host handlers | `tests/test_tool_registry.py` plus real temporary filesystem actions |
-| Feed execution results into the next turn | Runtime appends the assistant decision and JSON tool-result observation to local history | Feedback assertions in `tests/test_tool_agent.py` |
-| Finish without another tool request | `action=final` returns typed `ToolRunOutcome`, then `AgentResult` | Generic final-contract and immediate-final tests |
-| Bound runaway execution | At most N tool attempts and N+1 model turns; extra action is rejected before execution | Budget exhaustion and final-at-budget tests |
-| Let the model react to expected failures | Expected tool errors become observations | Missing-file observation test and new adaptive list/read/write recovery tests |
-| Preserve retry and side-effect boundaries | Router retries a model request; runtime executes accepted actions afterward | Retry-without-write-replay and partial-effect tests |
-| Keep runs isolated | History, traces, and call IDs are local variables | Concurrent run-isolation test |
+| Agent iteration and termination | NTG `run_with_tools` | LangChain `AgentExecutor.invoke` |
+| Action interpretation | NTG `AgentDecision` | Official LangChain JSON ReAct parser |
+| Action/observation history | NTG manually appended messages | Official LangChain scratchpad rendering |
+| Tool dispatch | NTG loop selected registry execution | LangChain invokes a `StructuredTool` |
+| Tool permissions and input/output validation | NTG registry and filesystem | Same host validation and filesystem implementation |
+| Provider selection/recovery | NTG client/service/LiteLLM | Same implementation, behind `NTGChatModel` |
+| Final output contract | Embedded in every intermediate decision | Independently validate LangChain final output |
+| Execution ceiling | Custom action bound plus extra final turn | One `AgentExecutor.max_iterations` bound |
+| Routing/action diagnostics | Custom runtime aggregation | Per-run adapter/tool evidence, no raw trajectories |
+| Direct completion and no-tools Agent | Direct NTG calls | Same direct calls; lazy framework import |
 
-The core loop already shipped as part of Milestone 5. A second loop or a new
-agent framework would duplicate working behavior. No new production subsystem
-is needed for the supplied Milestone 6 goal.
+## Concrete migration
 
-## Compatibility and feasibility
+1. Pin official packages; add a `BaseChatModel` adapter around the existing client.
+2. Convert immutable tool registrations to typed `StructuredTool` instances.
+   Use closed JSON argument schemas so strict host validation sees original types
+   and required fields instead of LangChain-coerced values or inserted defaults.
+3. Replace the runtime with one factory/executor invocation and final validation.
+   Remove `_Decision`, `build_decision_model`, manual history, and the custom loop.
+4. Map `max_tool_calls` directly to the executor iteration bound; document that
+   final output consumes an iteration and exhaustion returns sanitized 508.
+5. Retain safe run-local diagnostics, prevent trace uploads/verbose output, and
+   preserve provider errors and partial-write evidence.
+6. Verify actual executor/tool/model paths, observation-dependent behavior,
+   recovery, limits, strict output, no replay, direct APIs, and a real temporary
+   workspace greeting edit. Run the complete offline suite and Ruff.
 
-`LLMClient.chat.completions.create` accepts structured text completions.
-`CompletionService.chat_completion` accepts system/user/assistant text roles and
-rejects native tool messages. The existing runtime therefore encodes tool results
-as user-message JSON observations and identifies them as data in the system
-instruction. That transport satisfies the requested feedback behavior while
-preserving all current provider adapters. Native tool calling would expand the
-facade, response contracts, normalization, and adapter scope without advancing
-this milestone's stated goal.
+No custom Thought/Action parser, router rewrite, new provider SDK, shell tools,
+planner/reviewer roles, or parallel agent loop is introduced. The filesystem
+policy is a trusted-workspace boundary rather than an OS execution sandbox.
 
-Nonempty tool registries enable the loop; absent/empty registries preserve the
-single-call behavior. `max_tool_calls` is already the public execution bound.
-Provider retries may produce more upstream HTTP attempts than model decision
-turns. This is intentional and separate from tool execution.
+## Verification boundary
 
-Existing scripted tests verify history and real actions, but a fixed sequence
-alone cannot show that a later choice depends on an observed value. The useful
-remaining work is an explicit ReAct policy, observation-dependent acceptance
-scenarios, recovery evidence, sequential isolation, and Milestone 6 documentation.
-These are verification gaps, not demonstrated runtime defects.
+The previous custom-loop baseline was 203 passed and one Windows symlink skip.
+New tests use the actual LangChain runtime with mocked provider responses and
+temporary SQLite/workspace state. They can prove host integration and side effects,
+but do not establish live model quality. Live HTTP is blocked by the shared test
+fixture. Configuration, credentials, and production SQLite state remain untouched.
 
-## Recommended scope
+Migration results: **209 passed, 1 skipped** in the complete suite. Ruff lint and
+formatting and CLI help passed. The separate instrumented greeting E2E passed,
+confirming actual LangChain execution and an on-disk edit through NTG handlers.
+Nine client/routing/recovery/schema/filesystem implementation files were compared
+byte-for-byte against the published baseline and remain unchanged. Platform
+skip and optional installed-package warnings are recorded in the usage document.
 
-Adapt the runtime to an explicitly prompted, completion-driven ReAct cycle.
-Retain the registry, schemas, provider recovery, CLI options, and public
-result contracts. Add deterministic integration tests through the real client,
-completion service, validation, registry, and temporary workspace. Add usage and
-acceptance documentation, then update the README to identify Milestone 6.
-
-Do not add planning agents, shell execution, code execution, persistent memory,
-resume/replay, streaming, native function calling, or automatic invalid-output
-repair. None is necessary for the supplied goal. Final structured output is the
-model's completion signal; the host does not independently prove task correctness.
-
-## Validation boundary
-
-Baseline checked on 2026-10-22: `python -m pytest -q` returned **195 passed,
-1 skipped** in 56.13 seconds. `python -m ruff check .` passed and
-`python -m ruff format --check .` reported 53 files already formatted. The
-existing native-symlink test skips when this Windows host cannot create links.
-
-Post-implementation verification: **203 passed, 1 skipped** in 59.52 seconds;
-the focused tool-agent suite passed 25 tests. Ruff lint, formatting, and CLI help
-passed. New tests verify adaptive trajectories in both response modes, variable
-completion lengths, sequential isolation, and final output at zero remaining
-tool attempts. The same Windows native-symlink limitation accounts for the skip.
-
-The full offline suite and Ruff were run before and after the changes. Tests
-block live HTTP and use temporary SQLite state and filesystem roots. Mocked
-provider tests establish host behavior, not live model judgment or universal
-provider schema compatibility. A live smoke test is optional and is not a
-completion requirement for this plan.
-
-Git resolves to an ancestor outside NTG, and NTG is untracked in that repository.
-Avoid broad staging or commits that could capture unrelated user files. Planning
-and implementation changes should remain scoped to this directory.
-
-See [the concrete implementation plan](../plan/feature-agent-loop-milestone6-v1.md).
+See [current usage](milestone6.md) and the
+[migration plan](../plan/refactor-langchain-react-v1.md).
