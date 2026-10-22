@@ -1,0 +1,14 @@
+[
+  {
+    "model": "gemini-3.8-flash",
+    "response_mode": "json_schema"
+  },
+  {
+    "model": "gemini-3.5-flash-lite",
+    "response_mode": "json_schema"
+  },
+  {
+    "model": "gemini-3.1-flash-lite",
+    "response_mode": "json_schema"
+  }
+]

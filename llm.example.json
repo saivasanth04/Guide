@@ -1,0 +1,45 @@
+{
+  "include_legacy_gemini": true,
+  "accounts": [
+    {
+      "enabled": false,
+      "label": "gemini-extra",
+      "provider": "gemini",
+      "project_id": "YOUR_GOOGLE_CLOUD_PROJECT_ID",
+      "api_key_env": "GEMINI_API_KEY",
+      "models": [
+        {
+          "model": "gemini-3.8-flash",
+          "response_mode": "json_schema"
+        }
+      ],
+      "account_id": "YOUR_GOOGLE_CLOUD_PROJECT_ID"
+    },
+    {
+      "enabled": false,
+      "label": "groq-account",
+      "provider": "groq",
+      "api_key_env": "GROQ_API_KEY",
+      "models": [
+        {
+          "model": "REPLACE_WITH_GROQ_MODEL_ID",
+          "response_mode": "json_object"
+        }
+      ],
+      "account_id": "YOUR_GROQ_ORGANIZATION_ID"
+    },
+    {
+      "enabled": false,
+      "label": "openrouter-account",
+      "provider": "openrouter",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "models": [
+        {
+          "model": "REPLACE_WITH_OPENROUTER_MODEL_ID",
+          "response_mode": "json_object"
+        }
+      ],
+      "account_id": "openrouter-global"
+    }
+  ]
+}
