@@ -9,10 +9,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .venv/
-
 *.egg-info/
 build/
 dist/
-agent_workspace/
 artifacts/
-examples/milestone9/workspace/
