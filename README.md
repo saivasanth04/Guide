@@ -3,10 +3,11 @@
 Application code uses one client regardless of whether Gemini, Groq, OpenRouter,
 or another configured LiteLLM provider supplies the answer.
 
-Milestone 6 uses LangChain's actual `create_react_agent` and `AgentExecutor` from
-the pinned `langchain-classic` package. LangChain owns tool selection, execution,
-observations, scratchpad history, and termination. An `NTGChatModel` adapter sends
-every model call through the existing NTG client and router.
+Milestone 6 uses a compiled LangGraph `StateGraph` to schedule model decisions,
+tool execution, and observation-driven continuation. The graph ends on a validated
+final answer. An `NTGChatModel` adapter sends every model call through the existing
+NTG client and router. `langchain-core` supplies shared model/tool interfaces;
+`langchain-classic` and its executor are no longer required.
 See [Milestone 6 architecture and usage](docs/milestone6.md).
 One Python Coder can read, write, and list files, then return validated structured
 output. See [Milestone 5 tool policy](docs/milestone5.md).
@@ -38,24 +39,23 @@ print(result.model_dump_json(indent=2))
 ```
 
 The model selects a registered `read_file`, `write_file`, or `list_files` request.
-LangChain dispatches a typed tool whose NTG handler validates and executes it;
-LangChain then incorporates the observation into its scratchpad.
+The graph tool node dispatches a typed tool whose NTG handler validates and executes
+it; the returned observation becomes graph state for the next model decision.
 Files are scoped to the explicit workspace. Protected credential/state paths,
 traversal, and filesystem links are rejected. Replacement requires host
 `--allow-overwrite` and a tool request with `overwrite=true`.
 
-`--max-tool-calls` maps to `AgentExecutor.max_iterations` and defaults to 8.
-The official single-action parser permits one tool per iteration; the final
-decision also occupies an iteration. A run needing three tools plus a final
-answer requires at least four iterations. Exhaustion returns a sanitized 508;
-there is no separate NTG action counter or extra final turn.
+`--max-tool-calls=N` defaults to 8 and maps to LangGraph's `recursion_limit=2*N`.
+Each model/tool pair uses two graph steps; a final decision ends in the model node.
+A run needing three tools plus a final answer requires a limit of at least four.
+Exhaustion returns a sanitized 508. There is no separate host action counter or
+extra final turn.
 Filesystem payload/list bounds are configurable
 host policy, separate from provider quotas. Successful actions appear in
 `diagnostics.tool_calls`; model turns and upstream failures appear in
 `agent_steps`, `agent_step_count`, `attempts`, and `failed_attempts`.
-Diagnostics identify `agent_runtime` as `langchain-classic.AgentExecutor`.
-Traces omit file contents, scratchpads, and model reasoning. Verbose executor
-logging and LangSmith tracing are disabled for agent execution.
+Diagnostics identify `agent_runtime` as `langgraph.StateGraph`.
+Traces omit file contents, scratchpads, and model reasoning. Graph debug output and LangSmith tracing are disabled for agent execution.
 If a later turn fails, earlier writes remain and are reported in error diagnostics.
 Tool actions are never automatically retried or replayed by provider recovery.
 
@@ -207,7 +207,7 @@ ntg_llm/
     __init__.py           Public application API
     agent.py              Generic stateless Agent and typed AgentResult
     coder.py              First Coder role and Python output validation
-    tool_runtime.py       Construct/invoke LangChain ReAct agent and executor
+    tool_runtime.py       Compile/invoke the LangGraph ReAct graph
     langchain_model.py    NTGChatModel delegates model calls to LLMClient
     langchain_tools.py    Typed LangChain tools backed by the safe NTG registry
     agent_trace.py        Sanitized per-run routing and action evidence

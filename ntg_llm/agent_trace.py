@@ -12,7 +12,6 @@ class AgentTrace:
     steps: list[dict] = field(default_factory=list)
     tool_calls: list[dict] = field(default_factory=list)
     model: str = ""
-    stopped: bool = False
 
     def record_model(self, diagnostics, model=None):
         self.steps.append(
@@ -64,7 +63,7 @@ class AgentTrace:
             agent_steps=deepcopy(self.steps),
             agent_step_count=len(self.steps),
             tool_calls=deepcopy(self.tool_calls),
-            agent_runtime="langchain-classic.AgentExecutor",
+            agent_runtime="langgraph.StateGraph",
         )
         return result
 

@@ -1,97 +1,45 @@
-# Milestone 6 — LangChain migration feasibility
+# Milestone 6 — LangGraph migration feasibility
 
-Date: 2026-10-22. Status: implemented and verified.
+Date: 2026-10-22. The user requested migration from the installed classic LangChain
+ReAct executor to LangGraph.
 
-## Assessment before implementation
+## Assessment and choice
 
-The repository's prior runtime was an NTG-owned loop in `tool_runtime.py`.
-`ToolRegistry.build_decision_model` generated custom `action=tool/final` contracts;
-`run_with_tools` executed actions, inserted observations, and selected the next
-model decision. It was a ReAct-inspired implementation, not a LangChain agent.
-The previous verification-only/explicit-prompt milestone plans are superseded by
-the user's request for LangChain ownership.
+The existing `NTGChatModel`, typed tool adapters, run-local diagnostics and strict
+final schemas already isolate framework orchestration from provider routing and
+filesystem policy. The migration can replace `tool_runtime.py` and update its
+caller, dependency pin, tests and docs without modifying the backend or handlers.
 
-The existing router stack is ready to serve as the backend: `LLMClient` delegates
-to `CompletionService`, which owns round-robin selection, provider retries,
-fallback, and sanitized errors. The interface supports structured text responses,
-not native provider function calls. Filesystem handlers and strict registry
-validation can be reused unchanged beneath LangChain tools.
+Selected: `StateGraph` with model and tool nodes, conditional completion, and a
+back-edge carrying actual observations. LangGraph owns scheduling and state.
+Application nodes define the JSON protocol and rendering. Native-tool agent
+factories would require new router/tool-message capabilities; retaining the
+classic executor would not satisfy the requested migration.
 
-## Verified API selection
+Pin `langgraph==1.2.16` and retain `langchain-core==1.6.13`. Remove the classic
+requirement and all runtime imports of its factory, parser and executor.
+The [official graph API](https://docs.langchain.com/oss/python/langgraph/graph-api)
+and [agent examples](https://docs.langchain.com/oss/python/langgraph/workflows-agents)
+confirm support for explicit state, cyclic edges and invocation recursion limits.
 
-Installed versions were LangChain 1.3.1, core 1.4.0, classic 1.0.7, and LangGraph
-1.2.0. PyPI reported latest stable versions 1.4.7, 1.6.13, 1.0.8, and 1.2.16,
-respectively. Official docs recommend `langchain.agents.create_agent` for modern
-native tool-calling models. The exact requested `create_react_agent` and
-`AgentExecutor` remain available under `langchain_classic.agents`.
+## Implementation sequence
 
-Select and pin `langchain-classic==1.0.8` plus `langchain-core==1.6.13` for this
-text-only router. The official classic factory accepts a custom prompt and an
-official `JSONAgentOutputParser`, supporting dictionary action inputs
-for typed multi-field writes. Set `stop_sequence=False` because the current NTG
-client does not expose provider stop sequences. Use a nonstreaming runnable agent.
+1. Replace executor construction with a compiled two-node graph and invoke once.
+2. Preserve NTG's text-only transport using a strict single JSON action protocol.
+3. Use graph recursion_limit=2*N to preserve the existing N-decision limit.
+4. Retain strict tool/final validation, sanitized diagnostics and tracing policy.
+5. Adapt integration spies to real graph execution; add strict parser and exact
+   boundary cases; run the complete suite, Ruff and CLI help.
+6. Publish reviewed files to Guide using the isolated publishing checkout.
 
-This is the older classic implementation; its official source recommends modern
-`create_agent` for new production applications. It is selected for compatibility,
-not presented as modern LangChain's preferred API. A modern native-call migration
-would additionally need `bind_tools`, native tool-message support, provider
-capability handling, and structured-output strategy changes beyond this task's
-preserved text contract.
+## Tradeoffs and verification boundary
 
-Checked sources: [official migration guide](https://docs.langchain.com/oss/python/migrate/langchain-v1),
-[PyPI classic metadata](https://pypi.org/pypi/langchain-classic/json),
-[PyPI core metadata](https://pypi.org/pypi/langchain-core/json), and installed official
-factory, executor, tool, and JSON parser source for the pinned releases.
+The old classic parser is replaced by a small host JSON decoder; lists, partial
+JSON and duplicate keys are rejected. This intentionally tightens behavior.
+Core model/tool types remain in use because LangGraph depends on core. No durable
+checkpointing, resume, streaming or parallel tool execution is introduced.
+The recursion mapping relies on the two-node topology and is regression-tested.
+Real providers are not exercised by the offline tests. Existing filesystem and
+provider recovery contracts remain the source of policy.
 
-## Responsibility cross-check
-
-| Responsibility | Before | After |
-|---|---|---|
-| Agent iteration and termination | NTG `run_with_tools` | LangChain `AgentExecutor.invoke` |
-| Action interpretation | NTG `AgentDecision` | Official LangChain JSON ReAct parser |
-| Action/observation history | NTG manually appended messages | Official LangChain scratchpad rendering |
-| Tool dispatch | NTG loop selected registry execution | LangChain invokes a `StructuredTool` |
-| Tool permissions and input/output validation | NTG registry and filesystem | Same host validation and filesystem implementation |
-| Provider selection/recovery | NTG client/service/LiteLLM | Same implementation, behind `NTGChatModel` |
-| Final output contract | Embedded in every intermediate decision | Independently validate LangChain final output |
-| Execution ceiling | Custom action bound plus extra final turn | One `AgentExecutor.max_iterations` bound |
-| Routing/action diagnostics | Custom runtime aggregation | Per-run adapter/tool evidence, no raw trajectories |
-| Direct completion and no-tools Agent | Direct NTG calls | Same direct calls; lazy framework import |
-
-## Concrete migration
-
-1. Pin official packages; add a `BaseChatModel` adapter around the existing client.
-2. Convert immutable tool registrations to typed `StructuredTool` instances.
-   Use closed JSON argument schemas so strict host validation sees original types
-   and required fields instead of LangChain-coerced values or inserted defaults.
-3. Replace the runtime with one factory/executor invocation and final validation.
-   Remove `_Decision`, `build_decision_model`, manual history, and the custom loop.
-4. Map `max_tool_calls` directly to the executor iteration bound; document that
-   final output consumes an iteration and exhaustion returns sanitized 508.
-5. Retain safe run-local diagnostics, prevent trace uploads/verbose output, and
-   preserve provider errors and partial-write evidence.
-6. Verify actual executor/tool/model paths, observation-dependent behavior,
-   recovery, limits, strict output, no replay, direct APIs, and a real temporary
-   workspace greeting edit. Run the complete offline suite and Ruff.
-
-No custom Thought/Action parser, router rewrite, new provider SDK, shell tools,
-planner/reviewer roles, or parallel agent loop is introduced. The filesystem
-policy is a trusted-workspace boundary rather than an OS execution sandbox.
-
-## Verification boundary
-
-The previous custom-loop baseline was 203 passed and one Windows symlink skip.
-New tests use the actual LangChain runtime with mocked provider responses and
-temporary SQLite/workspace state. They can prove host integration and side effects,
-but do not establish live model quality. Live HTTP is blocked by the shared test
-fixture. Configuration, credentials, and production SQLite state remain untouched.
-
-Migration results: **209 passed, 1 skipped** in the complete suite. Ruff lint and
-formatting and CLI help passed. The separate instrumented greeting E2E passed,
-confirming actual LangChain execution and an on-disk edit through NTG handlers.
-Nine client/routing/recovery/schema/filesystem implementation files were compared
-byte-for-byte against the published baseline and remain unchanged. Platform
-skip and optional installed-package warnings are recorded in the usage document.
-
-See [current usage](milestone6.md) and the
-[migration plan](../plan/refactor-langchain-react-v1.md).
+See [current implementation and usage](milestone6.md).

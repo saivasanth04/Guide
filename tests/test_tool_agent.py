@@ -1,4 +1,4 @@
-"""Real LangChain factory/executor with NTG routing and temporary filesystem tools."""
+"""Real LangGraph execution with NTG routing and temporary filesystem tools."""
 
 import ast
 import inspect
@@ -28,7 +28,7 @@ def final(output=None):
 
 
 def observations(history):
-    """Read actual LangChain scratchpad observations in the fake provider only."""
+    """Read actual graph scratchpad observations in the fake provider only."""
     return [
         json.loads(line.removeprefix("Observation: "))
         for line in history[-1]["content"].splitlines()
@@ -75,45 +75,38 @@ def stack(tmp_path, steps=None, *, choose=None, mode="json_schema", limit=8, ove
     return root, service, agent
 
 
-def test_real_factory_executor_and_tools_own_basic_run(tmp_path, monkeypatch):
+def test_real_graph_and_tools_own_basic_run(tmp_path, monkeypatch):
     import ntg_llm.tool_runtime as runtime
+    from langgraph.graph.state import CompiledStateGraph
     from langchain_core.tools import StructuredTool
 
-    invoked, factories, tool_names = [], [], []
-    real_factory, real_invoke, real_tool_run = (
-        runtime.create_react_agent,
-        runtime.AgentExecutor.invoke,
-        StructuredTool._run,
-    )
+    invoked, tool_names = [], []
+    real_invoke, real_tool_run = CompiledStateGraph.invoke, StructuredTool._run
 
-    def factory(**kwargs):
-        factories.append(kwargs)
-        return real_factory(**kwargs)
-
-    def invoke(executor, *args, **kwargs):
-        invoked.append(executor)
-        return real_invoke(executor, *args, **kwargs)
+    def invoke(graph, *args, **kwargs):
+        invoked.append((graph, kwargs["config"]))
+        return real_invoke(graph, *args, **kwargs)
 
     @wraps(real_tool_run)
     def tool_run(tool, *args, **kwargs):
         tool_names.append(tool.name)
         return real_tool_run(tool, *args, **kwargs)
 
-    monkeypatch.setattr(runtime, "create_react_agent", factory)
-    monkeypatch.setattr(runtime.AgentExecutor, "invoke", invoke)
+    monkeypatch.setattr(CompiledStateGraph, "invoke", invoke)
     monkeypatch.setattr(StructuredTool, "_run", tool_run)
     _, service, agent = stack(tmp_path, [action("list_files", path="."), final()])
     result = agent.run("Inspect the workspace")
-    assert len(invoked) == len(factories) == 1
+    assert len(invoked) == 1
+    graph, config = invoked[0]
+    assert set(graph.nodes) == {"__start__", "model", "tools"}
+    assert config["recursion_limit"] == 16
     assert tool_names == ["list_files"]
-    assert all(isinstance(tool, StructuredTool) for tool in factories[0]["tools"])
-    assert invoked[0].max_iterations == 8 and invoked[0].handle_parsing_errors is False
-    assert result.diagnostics["agent_runtime"] == "langchain-classic.AgentExecutor"
+    assert result.diagnostics["agent_runtime"] == "langgraph.StateGraph"
     assert result.diagnostics["agent_step_count"] == 2
     assert observations(service.router.histories[1])[0]["tool"] == "list_files"
     assert not hasattr(runtime, "run_with_tools")
-    assert not hasattr(agent.tools, "build_decision_model")
-    runtime_ast = ast.parse(inspect.getsource(runtime.run_langchain_agent))
+    assert not hasattr(runtime, "AgentExecutor")
+    runtime_ast = ast.parse(inspect.getsource(runtime.run_langgraph_agent))
     assert not any(
         isinstance(node, (ast.While, ast.For, ast.AsyncFor)) for node in ast.walk(runtime_ast)
     )
@@ -162,14 +155,14 @@ def test_observed_directory_and_contents_drive_actions_and_final(tmp_path, mode,
     assert "mock-secret" not in result.model_dump_json()
 
 
-def test_e2e_greeting_edit_uses_real_langchain_and_router(tmp_path, monkeypatch):
+def test_e2e_greeting_edit_uses_real_langgraph_and_router(tmp_path, monkeypatch):
     from ntg_llm.langchain_model import NTGChatModel
-    from ntg_llm.tool_runtime import AgentExecutor
+    from langgraph.graph.state import CompiledStateGraph
     from ntg_llm.tools.filesystem import FilesystemTools
 
     events = []
     for cls, name, label in (
-        (AgentExecutor, "invoke", "executor"),
+        (CompiledStateGraph, "invoke", "graph"),
         (NTGChatModel, "_generate", "model"),
         (FilesystemTools, "write_file", "write"),
     ):
@@ -211,12 +204,12 @@ def test_e2e_greeting_edit_uses_real_langchain_and_router(tmp_path, monkeypatch)
         encoding="utf-8"
     ) == 'def greeting():\n    return "Hello from ReAct"\n'
     assert result.output.explanation == f"Modified {filename}."
-    assert events == ["executor", "model", "model", "model", "write", "model"]
+    assert events == ["graph", "model", "model", "model", "write", "model"]
     assert len(service.router.calls) == 4
     assert [item["turn_number"] for item in result.diagnostics["attempts"]] == [1, 2, 3, 4]
 
 
-def test_limit_is_owned_by_executor_and_never_executes_extra_action(tmp_path):
+def test_limit_is_owned_by_graph_and_never_executes_extra_action(tmp_path):
     root, service, agent = stack(
         tmp_path,
         [
@@ -234,7 +227,7 @@ def test_limit_is_owned_by_executor_and_never_executes_extra_action(tmp_path):
     assert len(error.value.diagnostics["tool_calls"]) == 1
 
 
-def test_final_decision_fits_within_executor_limit(tmp_path):
+def test_final_decision_fits_within_graph_limit(tmp_path):
     _, service, agent = stack(tmp_path, [action("list_files", path="."), final()], limit=2)
     assert agent.run("Inspect").output.code == "pass"
     assert len(service.router.calls) == 2
@@ -303,7 +296,7 @@ def test_provider_retry_does_not_replay_successful_write(tmp_path, monkeypatch):
     assert service.router.histories[1] == service.router.histories[2]
 
 
-def test_protocol_labels_in_code_do_not_confuse_official_json_parser(tmp_path):
+def test_protocol_labels_in_code_do_not_confuse_action_parser(tmp_path):
     code = 'def label():\n    return "Final Answer: Observation: Action:"\n'
     root, _, agent = stack(
         tmp_path,
@@ -316,8 +309,9 @@ def test_protocol_labels_in_code_do_not_confuse_official_json_parser(tmp_path):
     assert result.output.code == (root / "labels.py").read_text() == code
 
 
+@pytest.mark.parametrize("malformed", [False, True])
 def test_private_trajectory_is_not_printed_logged_or_uploaded(
-    tmp_path, capsys, caplog, monkeypatch
+    tmp_path, capsys, caplog, monkeypatch, malformed
 ):
     from langsmith import Client, tracing_context
 
@@ -329,21 +323,28 @@ def test_private_trajectory_is_not_printed_logged_or_uploaded(
 
     monkeypatch.setattr(Client, "create_run", record_upload)
     monkeypatch.setattr(Client, "update_run", record_upload)
-    # The official parser accepts the first action in a list and normally logs
-    # the complete list. The integration suppresses that unsafe parser warning.
+    # Reject ambiguous multi-action output without logging or uploading its contents.
     text = json.dumps(
         [
             {"action": "list_files", "action_input": {"path": "."}},
             {"action": private, "action_input": {}},
         ]
     )
-    _, _, agent = stack(tmp_path, [{"answer": text}, final()])
+    steps = [{"answer": text}, final()] if malformed else [action("list_files", path="."), final()]
+    _, _, agent = stack(tmp_path, steps)
     with tracing_context(enabled=True):
-        result = agent.run("Inspect")
+        if malformed:
+            with pytest.raises(LLMError) as error:
+                agent.run("Inspect")
+            assert error.value.diagnostics["tool_calls"] == []
+            serialized = json.dumps(error.value.as_dict())
+        else:
+            result = agent.run("Inspect")
+            assert len(result.diagnostics["tool_calls"]) == 1
+            serialized = result.model_dump_json()
     assert uploads == []
-    assert len(result.diagnostics["tool_calls"]) == 1
     output = capsys.readouterr()
-    assert private not in output.out + output.err + caplog.text + result.model_dump_json()
+    assert private not in output.out + output.err + caplog.text + serialized
 
 
 def test_provider_failure_preserves_partial_effects_retry_after_and_diagnostics(tmp_path):
@@ -417,7 +418,7 @@ def test_invalid_budget_fails_before_any_client_or_action(budget):
     assert error.value.status_code == 400
 
 
-def test_sequential_and_concurrent_runs_keep_independent_langchain_state(tmp_path):
+def test_sequential_and_concurrent_runs_keep_independent_langgraph_state(tmp_path):
     root = tmp_path / "workspace"
     root.mkdir()
 
@@ -446,3 +447,32 @@ def test_sequential_and_concurrent_runs_keep_independent_langchain_state(tmp_pat
         assert result.diagnostics["agent_step_count"] == 2
     for i in range(8):
         assert (root / f"file{i}").read_text() == f"file{i}"
+
+
+@pytest.mark.parametrize("limit", [1, 2, 4])
+def test_graph_limit_stops_after_exactly_requested_decisions(tmp_path, limit):
+    _, service, agent = stack(
+        tmp_path, choose=lambda _: action("list_files", path="."), limit=limit
+    )
+    with pytest.raises(LLMError) as error:
+        agent.run("Keep inspecting")
+    assert error.value.status_code == 508
+    assert len(service.router.calls) == len(error.value.diagnostics["tool_calls"]) == limit
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '{"action":"list_files","action":"Final Answer","action_input":{}}',
+        '{"action":"list_files","action_input":{"path":".","path":"secret"}}',
+        '{"action":"list_files","action_input":{"path":"."}',
+        '{"action":"list_files","action_input":{"path":"."},"extra":true}',
+        '{"action":"list_files","action_input":"."}',
+    ],
+)
+def test_ambiguous_or_incomplete_protocol_never_executes_tool(tmp_path, text):
+    _, _, agent = stack(tmp_path, [{"answer": text}])
+    with pytest.raises(LLMError) as error:
+        agent.run("Inspect")
+    assert error.value.status_code == 502
+    assert error.value.diagnostics["tool_calls"] == []

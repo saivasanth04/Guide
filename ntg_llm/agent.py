@@ -31,8 +31,8 @@ class Agent(Generic[OutputT]):
     """Configure a role once; each run supplies its own task and optional context.
 
     Construction validates configuration without loading credentials. Tool-free
-    runs make one client invocation; tools use LangChain's ReAct factory/executor.
-    max_tool_calls maps to the executor's single-action iteration limit.
+    runs make one client invocation; tools use LangGraph's compiled ReAct graph.
+    max_tool_calls maps to the graph's single-action decision ceiling.
     Upstream retries remain owned by the existing router.
     """
 
@@ -83,9 +83,9 @@ class Agent(Generic[OutputT]):
         ]
         try:
             if self.tools:
-                from .tool_runtime import run_langchain_agent
+                from .tool_runtime import run_langgraph_agent
 
-                outcome = run_langchain_agent(
+                outcome = run_langgraph_agent(
                     self.llm, messages, self.response_model, self.tools, self.max_tool_calls
                 )
                 return AgentResult[self.response_model](

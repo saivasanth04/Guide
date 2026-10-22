@@ -8,6 +8,8 @@ status: Completed
 tags: [refactor, langchain, react]
 ---
 
+> Historical completed migration. Superseded by the LangGraph runtime; see [current architecture](../docs/milestone6.md).
+
 # Introduction
 
 ![Status: Completed](https://img.shields.io/badge/status-Completed-brightgreen)

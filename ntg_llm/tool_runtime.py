@@ -1,27 +1,23 @@
-"""Invoke LangChain's ReAct runtime; NTG owns adapters, policy, and final validation."""
+"""LangGraph owns ReAct scheduling; NTG owns protocol, adapters and policy."""
 
 import json
-import logging
+import re
 from dataclasses import dataclass
+from typing import Any
 
-from langchain_classic.agents import AgentExecutor, create_react_agent
-from langchain_classic.agents.agent import RunnableAgent
-from langchain_classic.agents.output_parsers import JSONAgentOutputParser
-from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.tools.render import render_text_description_and_args
+from langgraph.errors import GraphRecursionError
+from langgraph.graph import END, START, StateGraph
 from langsmith import tracing_context
 from pydantic import BaseModel
+from typing_extensions import TypedDict
 
 from .agent_trace import AgentTrace
 from .errors import RoutingError
 from .langchain_model import NTGChatModel
 from .langchain_tools import create_langchain_tools
 from .schemas import response_schema, validate_response
-
-# The official parser may log complete responses when the model returns a list.
-# Host traces provide safe evidence without exposing that private trajectory.
-logging.getLogger("langchain_classic.agents.output_parsers.json").addFilter(lambda record: False)
 
 
 @dataclass(frozen=True)
@@ -31,24 +27,39 @@ class ToolRunOutcome:
     diagnostics: dict
 
 
-class _HostEvents(BaseCallbackHandler):
-    """Enforce registered capabilities and identify framework stopping, without logs."""
+class _State(TypedDict):
+    scratchpad: str
+    action: str
+    arguments: dict[str, Any]
+    output: Any
 
-    raise_error = True
 
-    def __init__(self, names, trace):
-        self.names, self.trace = frozenset(names), trace
+def _unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate key")
+        result[key] = value
+    return result
 
-    def on_agent_action(self, action, **kwargs):
-        if action.tool not in self.names:
-            raise RoutingError(
-                502, "Agent requested an unregistered tool", {"code": "unknown_tool"}
-            )
 
-    def on_agent_finish(self, finish, **kwargs):
-        # The pinned RunnableAgent's forced-stop AgentFinish has an empty log.
-        # Parsed final answers have the original nonempty response as their log.
-        self.trace.stopped = not finish.log
+def _parse_action(text):
+    """Decode one complete action, optionally wrapped in the prompted code fence."""
+    text = text.strip()
+    if text.startswith("Action:"):
+        text = text[len("Action:") :].strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*\n(.*)\n```", text, re.DOTALL)
+    if fenced:
+        text = fenced.group(1)
+    action = json.loads(text, object_pairs_hook=_unique_object)
+    if (
+        not isinstance(action, dict)
+        or set(action) != {"action", "action_input"}
+        or not isinstance(action["action"], str)
+        or not isinstance(action["action_input"], dict)
+    ):
+        raise ValueError("Expected one action object")
+    return action
 
 
 _REACT_SYSTEM = """{role}
@@ -71,7 +82,7 @@ output object, matching this schema:
 Tool actions must use one name from [{tool_names}]. Supply all declared arguments,
 including overwrite for write_file. Never invent an Observation; the runtime
 provides it after executing the tool. Finish when the task is complete or explain
-limitations honestly in the final output. The executor allows at most {limit}
+limitations honestly in the final output. The graph allows at most {limit}
 single-action decision iterations, including the final decision.
 
 Available tools and argument schemas:
@@ -83,58 +94,75 @@ The transport envelope is separate from the final application output schema.
 """
 
 
-def run_langchain_agent(llm, messages, response_model, registry, max_tool_calls):
-    """Build a fresh executor per run and invoke it once; never implement iteration."""
+def run_langgraph_agent(llm, messages, response_model, registry, max_tool_calls):
+    """Invoke a fresh compiled graph once, with no host iteration or node retries."""
     trace = AgentTrace()
     tools = create_langchain_tools(registry, trace)
+    by_name = {tool.name: tool for tool in tools}
     prompt = ChatPromptTemplate.from_messages(
         [("system", _REACT_SYSTEM), ("human", "Question: {input}\n{agent_scratchpad}")]
     ).partial(
         role=messages[0]["content"],
         final_schema=json.dumps(response_schema(response_model)),
         limit=str(max_tool_calls),
+        tools=render_text_description_and_args(tools),
+        tool_names=", ".join(by_name),
+        input=messages[1]["content"],
     )
-    events = _HostEvents([tool.name for tool in tools], trace)
+    model = NTGChatModel(client=llm, trace=trace)
+
+    def decide(state: _State):
+        response = model.invoke(prompt.invoke({"agent_scratchpad": state["scratchpad"]}))
+        decision = _parse_action(response.content)
+        name, arguments = decision["action"], decision["action_input"]
+        if name == "Final Answer":
+            output = validate_response(
+                json.dumps(arguments, ensure_ascii=False),
+                response_model,
+                response_schema(response_model),
+            )
+            return {"action": name, "output": output}
+        if name not in by_name:
+            raise RoutingError(
+                502, "Agent requested an unregistered tool", {"code": "unknown_tool"}
+            )
+        return {"action": name, "arguments": arguments}
+
+    def observe(state: _State):
+        observation = by_name[state["action"]].invoke(state["arguments"])
+        # Store normalized actions and actual observations, never free-form reasoning.
+        action = json.dumps({"action": state["action"], "action_input": state["arguments"]})
+        return {
+            "scratchpad": state["scratchpad"] + f"Action: {action}\nObservation: {observation}\n"
+        }
+
+    def route(state: _State):
+        return END if state["action"] == "Final Answer" else "tools"
+
+    builder = StateGraph(_State)
+    builder.add_node("model", decide)
+    builder.add_node("tools", observe)
+    builder.add_edge(START, "model")
+    builder.add_conditional_edges("model", route, ["tools", END])
+    builder.add_edge("tools", "model")
+    graph = builder.compile()
     try:
         with tracing_context(enabled=False):
-            react = create_react_agent(
-                llm=NTGChatModel(client=llm, trace=trace),
-                tools=tools,
-                prompt=prompt,
-                output_parser=JSONAgentOutputParser(),
-                tools_renderer=render_text_description_and_args,
-                stop_sequence=False,
+            # Each decision/action pair uses two supersteps. Final answers end
+            # in the model node. This preserves the public decision ceiling.
+            result = graph.invoke(
+                {"scratchpad": ""}, config={"recursion_limit": 2 * max_tool_calls}
             )
-            executor = AgentExecutor(
-                agent=RunnableAgent(
-                    runnable=react,
-                    input_keys_arg=["input"],
-                    return_keys_arg=["output"],
-                    stream_runnable=False,
-                ),
-                tools=tools,
-                max_iterations=max_tool_calls,
-                early_stopping_method="force",
-                handle_parsing_errors=False,
-                verbose=False,
-                callbacks=[events],
+    except GraphRecursionError:
+        raise trace.failure(
+            RoutingError(
+                508, "LangGraph agent iteration limit reached", {"code": "tool_limit_reached"}
             )
-            result = executor.invoke({"input": messages[1]["content"]})
-        if trace.stopped:
-            raise RoutingError(
-                508,
-                "LangChain agent iteration limit reached",
-                {"code": "tool_limit_reached"},
-            )
-        final_content = result["output"]
-        if not isinstance(final_content, str):
-            final_content = json.dumps(final_content, ensure_ascii=False)
-        output = validate_response(final_content, response_model, response_schema(response_model))
+        ) from None
     except RoutingError as error:
         raise trace.failure(error) from None
     except Exception:
-        # Framework parser/validation errors can contain raw output and scratchpads.
         raise trace.failure(
-            RoutingError(502, "LangChain agent returned invalid action or final output")
+            RoutingError(502, "LangGraph agent returned invalid action or final output")
         ) from None
-    return ToolRunOutcome(output, trace.model, trace.diagnostics())
+    return ToolRunOutcome(result["output"], trace.model, trace.diagnostics())

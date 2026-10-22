@@ -9,7 +9,7 @@ from .tools.registry import ToolRegistry
 
 
 def create_langchain_tools(registry: ToolRegistry, trace: AgentTrace):
-    """Expose immutable registrations; LangChain decides when to invoke each tool."""
+    """Expose immutable registrations; the LangGraph tool node invokes each tool."""
 
     def adapt(spec):
         def observe(result):
