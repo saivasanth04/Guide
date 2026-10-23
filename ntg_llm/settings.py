@@ -1,6 +1,7 @@
 """Build the service from local secrets and non-secret configuration."""
 
 import json
+import math
 from pathlib import Path
 from . import runtime  # noqa: F401 - configure offline LiteLLM before importing Router
 from litellm import Router
@@ -26,7 +27,14 @@ def load_service(env_path=".env", router_factory=Router):
             "COMPLETION_MAX_DEPLOYMENTS", config.get("COMPLETION_MAX_ATTEMPTS", "all")
         )
         max_attempts = None if configured_maximum == "all" else int(configured_maximum)
-        retries = int(config.get("RETRIES_PER_DEPLOYMENT", "2"))
+        retries = int(config.get("RETRIES_PER_DEPLOYMENT", "0"))
+        request_timeout = float(config.get("PROVIDER_REQUEST_TIMEOUT", "30"))
+        routing_time_budget = float(config.get("COMPLETION_TIME_BUDGET", "60"))
+        if any(
+            not math.isfinite(value) or value <= 0
+            for value in (request_timeout, routing_time_budget)
+        ):
+            raise ValueError()
         if (max_attempts is not None and max_attempts < 1) or not 0 <= retries <= 3:
             raise ValueError()
         deployments = []
@@ -109,4 +117,6 @@ def load_service(env_path=".env", router_factory=Router):
         router_factory,
         max_attempts=max_attempts,
         retries_per_deployment=retries,
+        request_timeout=request_timeout,
+        routing_time_budget=routing_time_budget,
     )

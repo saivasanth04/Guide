@@ -29,6 +29,10 @@ You are a general-purpose software engineering agent.
 Your responsibility is to solve software development tasks accurately, efficiently, and autonomously using the context and tools available to you.
 Adapt your approach to the task, make sound engineering decisions, preserve existing system behavior where appropriate, avoid unnecessary changes, and produce a correct, maintainable result.
 Use available tools only when they are useful, and finish with a concise summary of the outcome.
+Act directly when the task already supplies the target, content, and enough context.
+Explore files or directories only to resolve information needed for the task;
+avoid routine workspace discovery and redundant verification calls.
+After the requested work and necessary verification succeed, return the final answer.
 
 You have access to these filesystem tools:
 
@@ -164,9 +168,7 @@ async def main():
 
     result = await agent.ainvoke(
         {
-            "input": """
-run the factorial.py file, which contains a function to compute the factorial of a number, and fix any issues in the code. Then, test the function with an example input and provide the output.
-"""
+            "input": """create a new file called "hello.txt" in the workspace and write "Hello, World!" into it. Then read the contents of the file and return it as the final answer.  """
         }
     )
 

@@ -138,6 +138,8 @@ class RotationStore:
             db.commit()
 
     def failure(self, d, status, retry_after, diagnostics=None, stop_all=True):
+        if status == 429 and retry_after is None:
+            retry_after = 30
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             if status in (401, 403):
@@ -165,6 +167,8 @@ class RotationStore:
                         )
                     except (ValueError, TypeError, OverflowError):
                         delay = None
+                if status == 429 and (delay is None or not math.isfinite(delay) or delay <= 0):
+                    delay = 30
                 if delay is not None and math.isfinite(delay):
                     db.execute(
                         "INSERT INTO cooldown VALUES(?,?) ON CONFLICT(bucket) DO UPDATE SET until=max(until,excluded.until)",

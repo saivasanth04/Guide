@@ -1,8 +1,12 @@
 """Completion validation and explicit retry/fallback orchestration."""
 
 import json
-import random
+import contextvars
+import math
+import queue
+import threading
 import time
+import httpx
 from .runtime import _CACHE_PRICES
 from litellm import Router
 from .defaults import ENFORCEMENT_REASONS
@@ -108,8 +112,11 @@ class CompletionService:
         ledger,
         router_factory=Router,
         max_attempts=None,
-        retries_per_deployment=2,
+        retries_per_deployment=0,
         sleeper=time.sleep,
+        request_timeout=30,
+        routing_time_budget=60,
+        clock=time.monotonic,
     ):
         max_attempts = len(deployments) if max_attempts is None else max_attempts
         if type(max_attempts) is not int or max_attempts < 1:
@@ -117,7 +124,22 @@ class CompletionService:
         self.max_attempts = max_attempts
         if type(retries_per_deployment) is not int or not 0 <= retries_per_deployment <= 3:
             raise ValueError("retries_per_deployment must be between 0 and 3")
+        # Legacy settings remain accepted; provider failures now always fail over.
         self.retries_per_deployment = retries_per_deployment
+        for name, value in (
+            ("request_timeout", request_timeout),
+            ("routing_time_budget", routing_time_budget),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise ValueError(f"{name} must be a positive finite number")
+        self.request_timeout = request_timeout
+        self.routing_time_budget = routing_time_budget
+        self.clock = clock
         self.sleeper = sleeper
         self.deployments, self.ledger = deployments, ledger
         self.strategy = PersistentRoundRobin(ledger, deployments)
@@ -144,7 +166,7 @@ class CompletionService:
             content_policy_fallbacks=[],
             disable_cooldowns=True,
             cache_responses=False,
-            timeout=60,
+            timeout=request_timeout,
         )
         self.strategy.model_list = self.router.model_list
         self.router.set_custom_routing_strategy(self.strategy)
@@ -182,10 +204,28 @@ class CompletionService:
         return self._run(messages, response_model, deployments, generation_options)
 
     def _run(self, messages, response_model=Answer, deployments=None, generation_options=None):
+        deadline = self.clock() + self.routing_time_budget
         schema = response_schema(response_model) if response_model is not None else None
         deployments = self.deployments if deployments is None else deployments
         tried, attempts = set(), []
+
+        def remaining():
+            seconds = deadline - self.clock()
+            if seconds <= 0:
+                raise RoutingError(
+                    504,
+                    "LLM routing time budget exhausted",
+                    {
+                        "time_budget_exhausted": True,
+                        "routing_time_budget_seconds": self.routing_time_budget,
+                        "attempt_count": len(attempts),
+                        "attempts": list(attempts),
+                    },
+                )
+            return seconds
+
         for _ in range(min(self.max_attempts, len(deployments))):
+            remaining()
             try:
                 d = self.ledger.select(deployments, excluded=tried)
             except RoutingError as error:
@@ -193,65 +233,56 @@ class CompletionService:
                     error.diagnostics["attempts"] = attempts
                 raise
             tried.add(d.id)
-            for retry_number in range(self.retries_per_deployment + 1):
-                if retry_number:
-                    delay = min(2 ** (retry_number - 1), 4)
-                    self.sleeper(delay + random.uniform(0, delay * 0.25))
-                    try:
-                        # Retry the same key/model without advancing the rotation.
-                        # Do not rewind the global cursor if another caller advanced it.
-                        self.ledger.select(self.deployments, only=d.id)
-                    except RoutingError as error:
-                        if error.status_code != 429:
-                            error.diagnostics["attempts"] = attempts
-                            raise
-                        # A provider Retry-After prevents retrying this deployment yet.
-                        last_error = error
-                        break
-                try:
-                    if generation_options is None:
-                        result = self._complete_once(messages, d, response_model, schema)
-                    else:
-                        result = self._complete_once(
-                            messages, d, response_model, schema, generation_options
-                        )
-                except RoutingError as error:
-                    failure = {
+            try:
+                result = self._complete_once(
+                    messages,
+                    d,
+                    response_model,
+                    schema,
+                    generation_options,
+                    timeout=min(self.request_timeout, remaining()),
+                )
+            except RoutingError as error:
+                failure = {
+                    **d.diagnostics,
+                    "status": error.status_code,
+                    "attempt_number": len(attempts) + 1,
+                    "retry_number": 0,
+                    "error": str(error),
+                }
+                if "access_error" in error.diagnostics:
+                    failure["reason"] = error.diagnostics["access_error"]["reason"]
+                attempts.append(failure)
+                error.diagnostics["attempts"] = list(attempts)
+                # Access enforcement remains terminal even at the deadline.
+                if not error.failover:
+                    raise
+                remaining()
+                if len(tried) >= min(self.max_attempts, len(deployments)):
+                    raise
+            else:
+                remaining()
+                result["diagnostics"]["failed_attempts"] = list(attempts)
+                result["diagnostics"]["attempt_count"] = len(attempts) + 1
+                result["diagnostics"]["attempts"] = [
+                    *attempts,
+                    {
                         **d.diagnostics,
-                        "status": error.status_code,
+                        "status": 200,
                         "attempt_number": len(attempts) + 1,
-                        "retry_number": retry_number,
-                        "error": str(error),
-                    }
-                    if "access_error" in error.diagnostics:
-                        failure["reason"] = error.diagnostics["access_error"]["reason"]
-                    attempts.append(failure)
-                    if error.failover:
-                        last_error = error
-                        break
-                    if not error.transient:
-                        error.diagnostics["attempts"] = attempts
-                        raise
-                    last_error = error
-                else:
-                    result["diagnostics"]["failed_attempts"] = list(attempts)
-                    result["diagnostics"]["attempt_count"] = len(attempts) + 1
-                    result["diagnostics"]["attempts"] = [
-                        *attempts,
-                        {
-                            **d.diagnostics,
-                            "status": 200,
-                            "attempt_number": len(attempts) + 1,
-                            "retry_number": retry_number,
-                        },
-                    ]
-                    return result
-            if len(tried) >= min(self.max_attempts, len(deployments)):
-                last_error.diagnostics["attempts"] = attempts
-                raise last_error
+                        "retry_number": 0,
+                    },
+                ]
+                return result
 
     def _complete_once(
-        self, messages, d, response_model=Answer, schema=None, generation_options=None
+        self,
+        messages,
+        d,
+        response_model=Answer,
+        schema=None,
+        generation_options=None,
+        timeout=None,
     ):
         schema = (
             response_schema(response_model)
@@ -292,7 +323,8 @@ class CompletionService:
                     "provider": {"allow_fallbacks": False, "require_parameters": True}
                 }
             stage = "provider_request"
-            response = self.router.completion(
+            response = self._provider_completion(
+                timeout=self.request_timeout if timeout is None else timeout,
                 model="structured",
                 messages=messages,
                 **({"response_format": response_format} if response_format is not None else {}),
@@ -317,7 +349,8 @@ class CompletionService:
                 "diagnostics": d.diagnostics,
             }
         except Exception as exc:
-            status = getattr(exc, "status_code", None) or 502
+            timed_out = isinstance(exc, (TimeoutError, httpx.TimeoutException))
+            status = 408 if timed_out else getattr(exc, "status_code", None) or 502
             access = access_failure(exc, status)
             if access and status not in (401, 403):
                 status = 403
@@ -332,6 +365,8 @@ class CompletionService:
                 or {}
             )
             retry = headers.get("retry-after") or headers.get("Retry-After")
+            if status == 429 and retry is None:
+                retry = 30
             enforcement = access is not None and access["reason"] in ENFORCEMENT_REASONS
             denied = status in (401, 403) and not enforcement
             self.ledger.failure(d, status, retry, diagnostics=diagnostics, stop_all=enforcement)
@@ -355,7 +390,10 @@ class CompletionService:
             # Never copy provider exception messages, request bodies, or credentials.
             transient = (
                 not isinstance(exc, RoutingError)
-                and getattr(exc, "status_code", None) in (408, 500, 502, 503, 504)
+                and (
+                    status in (408, 429, 500, 502, 503, 504)
+                    or isinstance(exc, (ConnectionError, httpx.TransportError))
+                )
                 and status != 403
             )
             message = (
@@ -377,7 +415,33 @@ class CompletionService:
                 diagnostics,
                 retry,
                 transient=transient,
-                failover=unavailable or denied,
+                failover=not enforcement
+                and (unavailable or denied or transient or stage == "response_validation"),
             ) from None
         finally:
             self.strategy.selection.reset(token)
+
+    def _provider_completion(self, *, timeout, **kwargs):
+        """Bound caller wait even when a sync SDK ignores its transport timeout.
+
+        A daemon worker only performs the provider call; late results cannot
+        update the ledger or request diagnostics. Preserve the selected deployment
+        ContextVar across the thread boundary. Do not wait for workers on shutdown.
+        """
+        outcome = queue.Queue(maxsize=1)
+        context = contextvars.copy_context()
+
+        def invoke():
+            try:
+                outcome.put((True, self.router.completion(timeout=timeout, **kwargs)))
+            except Exception as error:
+                outcome.put((False, error))
+
+        threading.Thread(target=context.run, args=(invoke,), daemon=True).start()
+        try:
+            success, value = outcome.get(timeout=timeout)
+        except queue.Empty:
+            raise TimeoutError("Provider attempt time limit exceeded") from None
+        if not success:
+            raise value
+        return value

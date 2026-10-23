@@ -19,8 +19,36 @@ no command-line prompt, agent, tool loop or project executor.
 The public method has the same keyword argument names as Google's
 `client.models.generate_content(*, model, contents, config=None)`.
 The implementation uses our existing provider routing, credential pool, persistent
-rotation, retries and sanitized errors; it does not create a separate Google client.
+rotation, failover and sanitized errors; it does not create a separate Google client.
 Credentials stay in `.env`, with provider/model settings in `llm.json` and `models.json`.
+
+Routing latency settings in `.env`:
+
+```dotenv
+RETRIES_PER_DEPLOYMENT=0
+PROVIDER_REQUEST_TIMEOUT=30
+COMPLETION_TIME_BUDGET=60
+COMPLETION_MAX_DEPLOYMENTS=all
+```
+
+Each LLM routing request has one monotonic deadline. Each provider attempt receives
+the smaller of its timeout and the remaining routing budget. Failed, timed-out,
+overloaded, invalid-response, and rate-limited deployments immediately fail over
+without retry sleeps. The legacy retry setting is accepted for configuration
+compatibility; it no longer enables repeated attempts against a failed deployment.
+429 responses enter deployment cooldown using `Retry-After`, or 30 seconds if the
+header is absent or invalid. Access-enforcement stops remain terminal.
+
+A bounded caller wait protects against synchronous SDKs that ignore timeouts.
+Such a call may finish in a daemon thread after the caller moves on; its late
+result cannot update the routing ledger. The deadline applies per LLM request,
+not to the entire multi-turn agent run, filesystem calls, or initial imports.
+Budget exhaustion raises a sanitized 504 with attempt diagnostics. Round-robin
+selection and specific-model scoping remain unchanged.
+
+Install coding-agent dependencies with `python -m pip install -e ".[dev,agent]"`.
+The tests include real local HTTP transport and an end-to-end ReAct run using the
+MCP filesystem server (requires Node.js/npx). These require no cloud credentials.
 
 - `model="router"` rotates across eligible configured deployments.
 - A specific model, such as `model="gemini-3.8-flash"`, rotates only among matching
