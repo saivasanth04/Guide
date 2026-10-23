@@ -165,12 +165,7 @@ async def main():
     result = await agent.ainvoke(
         {
             "input": """
-Inspect this project.
-
-Create a file called factorial.py containing
-a clean Python factorial function.
-
-Do not modify unrelated files.
+run the factorial.py file, which contains a function to compute the factorial of a number, and fix any issues in the code. Then, test the function with an example input and provide the output.
 """
         }
     )
