@@ -259,6 +259,8 @@ class CompletionService:
             else schema
         )
         token = self.strategy.selection.set(d)
+        stage = "request_configuration"
+        response_format = None
         try:
             options = dict(generation_options or {})
             if response_model is None:
@@ -279,11 +281,17 @@ class CompletionService:
                     "json_schema": {"name": "response", "strict": True, "schema": schema},
                 }
             provider_options = {}
+            if d.provider == "gemini":
+                # This facade accepts text/JSON, never native tool-call responses.
+                # ReAct tool descriptions in a text prompt can otherwise elicit
+                # function calls with content=None from Gemini.
+                provider_options["tool_choice"] = "none"
             if d.provider == "openrouter":
                 # Keep upstream endpoint fallbacks disabled: application owns attempts.
                 provider_options["extra_body"] = {
                     "provider": {"allow_fallbacks": False, "require_parameters": True}
                 }
+            stage = "provider_request"
             response = self.router.completion(
                 model="structured",
                 messages=messages,
@@ -294,6 +302,7 @@ class CompletionService:
                 **options,
                 **provider_options,
             )
+            stage = "response_validation"
             if response_model is None:
                 text = response.choices[0].message.content
                 if not isinstance(text, str) or not text.strip():
@@ -313,6 +322,8 @@ class CompletionService:
             if access and status not in (401, 403):
                 status = 403
             diagnostics = d.diagnostics
+            diagnostics["failure_stage"] = stage
+            diagnostics["exception_type"] = type(exc).__name__
             if access:
                 diagnostics["access_error"] = access
             headers = (
@@ -354,7 +365,11 @@ class CompletionService:
                 if unavailable
                 else "Provider temporarily unavailable"
                 if transient
-                else "Upstream completion failed or returned invalid JSON"
+                else "Provider request failed"
+                if diagnostics["failure_stage"] == "provider_request"
+                else "Provider returned empty or invalid text"
+                if response_model is None and response_format is None
+                else "Provider returned an invalid structured response"
             )
             raise RoutingError(
                 status,
