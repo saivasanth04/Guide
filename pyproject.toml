@@ -17,7 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<10", "ruff>=0.9,<1"]
-agent = ["langchain-core", "langchain-classic", "langchain-mcp-adapters"]
+agent = ["langchain-core", "langchain-classic", "langchain-mcp-adapters", "e2b>=2.5,<3",]
 
 [tool.setuptools.packages.find]
 include = ["ntg_llm*"]

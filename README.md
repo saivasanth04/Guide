@@ -47,6 +47,13 @@ Budget exhaustion raises a sanitized 504 with attempt diagnostics. Round-robin
 selection and specific-model scoping remain unchanged.
 
 Install coding-agent dependencies with `python -m pip install -e ".[dev,agent]"`.
+For sandbox execution, set `E2B_API_KEY` in `.env`; `E2B_TEMPLATE` is optional.
+The agent shares its workspace with the E2B executor. Source files sync before
+each command, and the sandbox persists until agent cleanup. Remote-only artifacts
+and dependencies remain between calls; sandbox edits are not downloaded locally.
+The tool description provides its Linux working directory and synchronization limits.
+Run the optional live MCP/E2B check in PowerShell with
+`$env:NTG_LIVE_E2B='1'; python -m pytest -q tests/test_e2b_sandbox.py`.
 The tests include real local HTTP transport and an end-to-end ReAct run using the
 MCP filesystem server (requires Node.js/npx). These require no cloud credentials.
 

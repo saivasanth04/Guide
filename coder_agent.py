@@ -3,7 +3,7 @@ import os
 import json
 import sys
 from pathlib import Path
-
+from e2b_sandbox import E2BSandboxExecutor
 from langchain_classic.agents import (
     AgentExecutor,
     create_react_agent,
@@ -26,15 +26,12 @@ from ntg_llm.langchain_adapter import NTGLangChainLLM
 REACT_PROMPT = PromptTemplate.from_template(
 """
 You are a general-purpose software engineering agent.
-Your responsibility is to solve software development tasks accurately, efficiently, and autonomously using the context and tools available to you.
-Adapt your approach to the task, make sound engineering decisions, preserve existing system behavior where appropriate, avoid unnecessary changes, and produce a correct, maintainable result.
-Use available tools only when they are useful, and finish with a concise summary of the outcome.
-Act directly when the task already supplies the target, content, and enough context.
-Explore files or directories only to resolve information needed for the task;
-avoid routine workspace discovery and redundant verification calls.
-After the requested work and necessary verification succeed, return the final answer.
+Complete the user's task accurately and efficiently using the available context and tools.
+Adapt your approach to the task, preserve relevant existing behavior, and make focused,
+maintainable changes. Act directly when enough information is available; investigate
+only what is needed to resolve uncertainty or verify the result.
 
-You have access to these filesystem tools:
+Available tools and their input schemas:
 
 {tools}
 
@@ -42,22 +39,37 @@ Available tool names:
 
 {tool_names}
 
-Workspace and tool protocol:
+Workspace: {workspace}
 
-- Never modify files outside the allowed workspace: {workspace}
-- Use absolute filesystem paths inside the workspace.
-- Action Input must be a JSON object matching the selected tool's schema.
-- Return one action per response and wait for the real tool observation.
-- Do not wrap JSON in Markdown fences or output Observation yourself.
+Working principles:
 
-When you need a tool, use:
+- Select tools by their declared capabilities and follow their input schemas.
+- Keep persistent project changes within the allowed workspace. Follow each tool's
+  path conventions and execution boundaries; local and isolated environments may
+  have different paths, files, dependencies, and lifetimes.
+- Use tool descriptions and observations to establish what an environment contains
+  and whether changes persist or synchronize. Do not assume changes in one
+  environment are available in another.
+- Choose inspection, editing, execution, and verification appropriate to the task.
+  Use observed failures to guide corrections and avoid redundant calls.
+- Base claims on actual observations. Report meaningful limitations or incomplete
+  verification, and finish once the requested work is complete.
+
+Response protocol:
+
+- Return exactly one tool action or one final answer per response.
+- For an action, replace the tool name and empty object below with the selected
+  tool and its actual JSON arguments:
 
 Action: tool_name
-Action Input: {{"path": "absolute path inside the workspace"}}
+Action Input: {{}}
 
-When the task is fully complete, use:
+- Action Input must be a JSON object matching the selected tool's schema.
+- Do not wrap arguments in Markdown fences or invent Observation text.
+- Wait for the real tool observation before choosing the next action.
+- When finished, use:
 
-Final Answer: short description of what was completed
+Final Answer: outcome, relevant verification, and any remaining limitations
 
 Task:
 
@@ -129,51 +141,86 @@ async def main():
 
     mcp_client = MultiServerMCPClient(filesystem_config(workspace))
 
-    # Discover tools from MCP
-    tools = await mcp_client.get_tools()
+    # Discover filesystem tools from MCP
+    filesystem_tools = await mcp_client.get_tools()
 
-    print("Available MCP tools:")
-
-    for tool in tools:
-        print(f" - {tool.name}")
-
-    # ----------------------------------------------
-    # Real ReAct Component
-    # ----------------------------------------------
-
-    react_agent = create_react_agent(
-        llm=llm,
-        tools=tools,
-        prompt=REACT_PROMPT.partial(workspace=workspace),
-        output_parser=RunnableLambda(parse_react_output),
-        tools_renderer=render_mcp_tools,
-        stop_sequence=True,
+    # E2B execution capability
+    sandbox_executor = E2BSandboxExecutor(
+        workspace=workspace,
     )
 
-    # ----------------------------------------------
-    # ReAct Executor
-    # ----------------------------------------------
+    try:
+        sandbox_tool = sandbox_executor.as_tool()
 
-    agent = AgentExecutor(
-        agent=react_agent,
-        tools=tools,
-        verbose=True,
-        max_iterations=25,
-        handle_parsing_errors=True,
-    )
+        tools = [
+            *filesystem_tools,
+            sandbox_tool,
+        ]
 
-    # ----------------------------------------------
-    # Task
-    # ----------------------------------------------
+        print("Available MCP tools:")
 
-    result = await agent.ainvoke(
-        {
-            "input": """create a new file called "hello.txt" in the workspace and write "Hello, World!" into it. Then read the contents of the file and return it as the final answer.  """
-        }
-    )
+        for tool in tools:
+            print(f" - {tool.name}")
 
-    print("\nFinal Result:")
-    print(result["output"])
+        # ----------------------------------------------
+        # Real ReAct Component
+        # ----------------------------------------------
+
+        react_agent = create_react_agent(
+            llm=llm,
+            tools=tools,
+            prompt=REACT_PROMPT.partial(workspace=workspace),
+            output_parser=RunnableLambda(parse_react_output),
+            tools_renderer=render_mcp_tools,
+            stop_sequence=True,
+        )
+
+        # ----------------------------------------------
+        # ReAct Executor
+        # ----------------------------------------------
+
+        agent = AgentExecutor(
+            agent=react_agent,
+            tools=tools,
+            verbose=True,
+            max_iterations=25,
+            handle_parsing_errors=True,
+        )
+
+        # ----------------------------------------------
+        # Task
+        # ----------------------------------------------
+
+        result = await agent.ainvoke(
+            {
+                "input": """
+Run a live integration check of filesystem editing and sandbox execution.
+
+Create a new, uniquely named test directory within the workspace so existing
+files are preserved. Use the filesystem tools to create a Python script there
+that defines factorial(n), rejects negative integers, and checks factorial(0) == 1
+and factorial(5) == 120 when run. On success, print E2B_CHECK_V1_OK.
+
+Run that script with execute_in_sandbox, using its relative project path.
+In the same sandbox command, create a uniquely named marker under /tmp and print
+its path. Then use the local filesystem tools to change only the script's success
+message to E2B_CHECK_V2_OK. Execute the updated script in a second sandbox call
+and verify that the marker created by the first call still exists.
+
+Keep the test files locally so I can inspect them. Do not modify unrelated files.
+If any step fails, report the actual failure rather than claiming success.
+In the final answer, include the local script path, both commands' exit codes and
+observed output, whether both calls used the same sandbox_id, and whether the
+marker persisted. Do not include credentials or environment-file contents.
+"""
+            }
+        )
+
+        print("\nFinal Result:")
+        print(result["output"])
+
+    finally:
+        await asyncio.to_thread(sandbox_executor.close)
 
 
 if __name__ == "__main__":
