@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shlex
 import warnings
@@ -92,6 +93,7 @@ class E2BSandboxExecutor:
         # This lets us remove source files deleted locally while preserving
         # remote-only files such as node_modules, .venv or compiler output.
         self._synced_paths: set[str] = set()
+        self._dependency_state: dict[str, str] = {}
 
     # --------------------------------------------------
     # Sandbox lifecycle
@@ -204,6 +206,60 @@ class E2BSandboxExecutor:
         return len(files)
 
     # --------------------------------------------------
+    # Automatic dependency installation
+    # --------------------------------------------------
+
+    def _dependency_plans(self):
+        """Discover Python and npm projects among files actually synchronized."""
+        manifests = {"requirements.txt", "pyproject.toml", "package.json"}
+        directories = sorted(
+            {
+                str(Path(path).parent.as_posix())
+                for path in self._synced_paths
+                if Path(path).name in manifests
+            }
+        )
+        for directory in directories:
+            base = self.workspace / directory
+
+            def available(name):
+                return (Path(directory) / name).as_posix() in self._synced_paths
+
+            commands = []
+            if available("requirements.txt"):
+                commands.append("python -m pip install -r requirements.txt")
+            elif available("pyproject.toml"):
+                sections = {
+                    line.split("#", 1)[0].strip()
+                    for line in (base / "pyproject.toml").read_text().splitlines()
+                }
+                if sections & {"[project]", "[build-system]", "[tool.poetry]"}:
+                    commands.append("python -m pip install -e .")
+            if available("package.json"):
+                commands.append(
+                    "npm ci"
+                    if any(available(lock) for lock in ("package-lock.json", "npm-shrinkwrap.json"))
+                    else "npm install"
+                )
+            # Include referenced requirement/constraint files and lockfiles so
+            # changes to them invalidate the successful-install cache too.
+            inputs = sorted(
+                path
+                for path in self._synced_paths
+                if (
+                    Path(path).suffix in {".txt", ".in", ".toml", ".lock"}
+                    or Path(path).name
+                    in {"package.json", "package-lock.json", "npm-shrinkwrap.json"}
+                )
+            )
+            fingerprint = hashlib.sha256()
+            for path in inputs:
+                fingerprint.update(path.encode())
+                fingerprint.update((self.workspace / path).read_bytes())
+            for command in commands:
+                yield directory, command, fingerprint.hexdigest()
+
+    # --------------------------------------------------
     # Command execution
     # --------------------------------------------------
 
@@ -214,9 +270,35 @@ class E2BSandboxExecutor:
     ) -> str:
         sandbox = None
         synced_files = 0
+        stage = "workspace_setup"
+        executed_command = command
+        installations = []
         try:
             sandbox = self._get_sandbox()
             synced_files = self.sync_workspace()
+            stage = "dependency_installation"
+            for directory, install_command, fingerprint in self._dependency_plans():
+                key = f"{directory}:{install_command}"
+                if self._dependency_state.get(key) == fingerprint:
+                    continue
+                executed_command = install_command
+                installation = sandbox.commands.run(
+                    install_command,
+                    cwd=f"{self.remote_workspace}/{directory}",
+                    timeout=300,
+                )
+                installations.append(
+                    {
+                        "command": install_command,
+                        "directory": directory,
+                        "exit_code": installation.exit_code,
+                        "stdout": self._truncate(installation.stdout),
+                        "stderr": self._truncate(installation.stderr),
+                    }
+                )
+                self._dependency_state[key] = fingerprint
+            stage = "command_execution"
+            executed_command = command
             result = sandbox.commands.run(
                 command,
                 cwd=self.remote_workspace,
@@ -237,6 +319,7 @@ class E2BSandboxExecutor:
                 # The session expired or was removed. The next call can recreate it.
                 self._sandbox = None
                 self._synced_paths.clear()
+                self._dependency_state.clear()
             return json.dumps(
                 {
                     "success": False,
@@ -249,6 +332,9 @@ class E2BSandboxExecutor:
                     "command": command,
                     "workspace": self.remote_workspace,
                     "synced_files": synced_files,
+                    "stage": stage,
+                    "executed_command": executed_command,
+                    "dependency_installations": installations,
                 }
             )
 
@@ -261,6 +347,9 @@ class E2BSandboxExecutor:
             "workspace": self.remote_workspace,
             "synced_files": synced_files,
             "sandbox_id": sandbox.sandbox_id,
+            "stage": stage,
+            "executed_command": executed_command,
+            "dependency_installations": installations,
         }
 
         return json.dumps(
@@ -294,6 +383,12 @@ class E2BSandboxExecutor:
                 "inside an isolated E2B Linux sandbox. "
                 "The current coding workspace is synchronized into "
                 "the sandbox automatically before execution. "
+                "Python requirements.txt (or pyproject.toml) and npm package.json "
+                "dependencies are installed automatically before commands, including "
+                "projects in subdirectories. Unchanged dependency files reuse the "
+                "successful installation; changes trigger installation again. "
+                "Dependency installation has its own 300-second timeout per step; "
+                "installation failures stop execution and are reported in the result. "
                 f"Commands start in {self.remote_workspace}; use relative project paths "
                 "or Linux paths in that environment, not local host paths. "
                 "The sandbox is reused during this session, but remote changes "
@@ -322,6 +417,7 @@ class E2BSandboxExecutor:
         finally:
             self._sandbox = None
             self._synced_paths.clear()
+            self._dependency_state.clear()
 
     def __enter__(self):
         return self

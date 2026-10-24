@@ -51,6 +51,12 @@ For sandbox execution, set `E2B_API_KEY` in `.env`; `E2B_TEMPLATE` is optional.
 The agent shares its workspace with the E2B executor. Source files sync before
 each command, and the sandbox persists until agent cleanup. Remote-only artifacts
 and dependencies remain between calls; sandbox edits are not downloaded locally.
+Before execution, dependencies install automatically for discovered Python
+(`requirements.txt`, otherwise an installable `pyproject.toml`) and npm
+(`package.json`) projects, including subdirectories. npm lockfiles select `npm ci`;
+otherwise `npm install` is used. Successful installs are reused until dependency
+files change. Each installation step has a 300-second timeout; failures stop the
+requested command and return installer output with `stage=dependency_installation`.
 The tool description provides its Linux working directory and synchronization limits.
 Run the optional live MCP/E2B check in PowerShell with
 `$env:NTG_LIVE_E2B='1'; python -m pytest -q tests/test_e2b_sandbox.py`.
