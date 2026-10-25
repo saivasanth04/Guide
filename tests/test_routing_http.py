@@ -18,7 +18,7 @@ from ntg_llm.store import RotationStore
 
 
 @contextmanager
-def endpoint(replies=None):
+def endpoint(replies=None, *, gemini=False):
     calls = []
     release = threading.Event()
 
@@ -60,6 +60,13 @@ def endpoint(replies=None):
                 }
             )
             encoded = json.dumps(payload).encode()
+            if gemini and not rate_limited:
+                payload = {"candidates": [{"content": {"role": "model", "parts": [
+                    {"text": payload["choices"][0]["message"]["content"]}
+                ]}, "finishReason": "STOP", "index": 0}],
+                    "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1, "totalTokenCount": 2},
+                    "modelVersion": "gemini-3.8-flash"}
+                encoded = json.dumps(payload).encode()
             try:
                 self.send_response(429 if rate_limited else 200)
                 if rate_limited:

@@ -24,7 +24,7 @@ def parse_react_output(text):
         except ValueError:
             raise OutputParserException(
                 "Action Input must be a JSON object",
-                observation='Use Action Input: {"path": "absolute path"} with the tool schema. '
+                observation="Use a JSON object matching the selected tool schema, including every required field. "
                 "Return one action and no Observation text or Markdown fences.",
                 llm_output=text,
                 send_to_llm=True,

@@ -205,6 +205,10 @@ class E2BSandboxExecutor:
 
         return len(files)
 
+    def workspace_inventory(self):
+        return [path.relative_to(self.workspace).as_posix() for path in self._workspace_files()
+                if ".agent_tests" not in path.relative_to(self.workspace).parts]
+
     # --------------------------------------------------
     # Automatic dependency installation
     # --------------------------------------------------
@@ -263,16 +267,38 @@ class E2BSandboxExecutor:
     # Command execution
     # --------------------------------------------------
 
+    def _source_snapshot(self, sandbox):
+        """Fingerprint project files without following links or hashing dependencies."""
+        exclusions = sorted(self.IGNORED_DIRECTORIES | {".env*", "*.egg-info"})
+        patterns = " -o ".join(f"-name {shlex.quote(name)}" for name in exclusions)
+        result = sandbox.commands.run(
+            f"find . \\( {patterns} \\) -prune -o -type f -exec sha256sum --zero -- {{}} +",
+            cwd=self.remote_workspace,
+            timeout=60,
+        )
+        snapshot = {}
+        for record in result.stdout.split("\0"):
+            if not record:
+                continue
+            if len(record) < 67 or record[64:66] != "  ":
+                raise RuntimeError("Unable to verify sandbox source integrity")
+            snapshot[record[66:]] = record[:64]
+        return snapshot
+
     def execute(
         self,
         command: str,
         timeout_seconds: int = 120,
+        *,
+        protect_source: bool = False,
     ) -> str:
         sandbox = None
         synced_files = 0
         stage = "workspace_setup"
         executed_command = command
         installations = []
+        snapshot = None
+        error_message = None
         try:
             sandbox = self._get_sandbox()
             synced_files = self.sync_workspace()
@@ -297,10 +323,16 @@ class E2BSandboxExecutor:
                     }
                 )
                 self._dependency_state[key] = fingerprint
+            if protect_source:
+                stage = "source_integrity"
+                snapshot = self._source_snapshot(sandbox)
+                # Protect synchronized inputs, not runtime data left by earlier tests.
+                snapshot = {path: digest for path, digest in snapshot.items()
+                            if path.removeprefix("./") in self._synced_paths}
             stage = "command_execution"
-            executed_command = command
+            executed_command = "bash -e -o pipefail -c " + shlex.quote(command)
             result = sandbox.commands.run(
-                command,
+                executed_command,
                 cwd=self.remote_workspace,
                 timeout=timeout_seconds,
             )
@@ -320,23 +352,8 @@ class E2BSandboxExecutor:
                 self._sandbox = None
                 self._synced_paths.clear()
                 self._dependency_state.clear()
-            return json.dumps(
-                {
-                    "success": False,
-                    "exit_code": None,
-                    "stdout": "",
-                    "stderr": "",
-                    "error": str(error)
-                    if isinstance(error, RuntimeError)
-                    else type(error).__name__,
-                    "command": command,
-                    "workspace": self.remote_workspace,
-                    "synced_files": synced_files,
-                    "stage": stage,
-                    "executed_command": executed_command,
-                    "dependency_installations": installations,
-                }
-            )
+            exit_code, stdout, stderr = None, "", ""
+            error_message = str(error) if isinstance(error, RuntimeError) else type(error).__name__
 
         payload = {
             "success": exit_code == 0,
@@ -346,11 +363,25 @@ class E2BSandboxExecutor:
             "command": command,
             "workspace": self.remote_workspace,
             "synced_files": synced_files,
-            "sandbox_id": sandbox.sandbox_id,
+            "sandbox_id": sandbox.sandbox_id if sandbox is not None else None,
             "stage": stage,
             "executed_command": executed_command,
             "dependency_installations": installations,
         }
+        if error_message:
+            payload["error"] = error_message
+        if snapshot is not None:
+            try:
+                after = self._source_snapshot(sandbox)
+                changes = sorted(path for path in snapshot if snapshot.get(path) != after.get(path))
+                payload["source_changes"] = changes
+                payload["runtime_artifacts"] = sorted(after.keys() - snapshot.keys())
+                if changes:
+                    payload["success"] = False
+                    payload["error"] = "Tester command changed project files"
+            except Exception as error:
+                payload["success"] = False
+                payload["error"] = f"Source integrity verification failed: {type(error).__name__}"
 
         return json.dumps(
             payload,
@@ -396,6 +427,9 @@ class E2BSandboxExecutor:
                 "filesystem tools. Environment files, ignored directories, and "
                 "files over 5 MiB are excluded from synchronization. "
                 "Use this tool to verify that code actually works. "
+                "Commands use bash errexit and pipefail: failed steps cannot be hidden "
+                "by a trailing echo or successful pipeline consumer. For expected failures, "
+                "use explicit assertions/conditional handling and check captured exit status. "
                 "Inspect stdout, stderr and exit_code, fix failures, "
                 "and execute again when necessary."
             ),

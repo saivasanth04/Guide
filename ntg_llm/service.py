@@ -252,6 +252,9 @@ class CompletionService:
                 }
                 if "access_error" in error.diagnostics:
                     failure["reason"] = error.diagnostics["access_error"]["reason"]
+                for field in ("failure_stage", "exception_type", "validation_errors"):
+                    if field in error.diagnostics:
+                        failure[field] = error.diagnostics[field]
                 attempts.append(failure)
                 error.diagnostics["attempts"] = list(attempts)
                 # Access enforcement remains terminal even at the deadline.
@@ -317,6 +320,17 @@ class CompletionService:
                 # ReAct tool descriptions in a text prompt can otherwise elicit
                 # function calls with content=None from Gemini.
                 provider_options["tool_choice"] = "none"
+                if "reasoning_effort" in options:
+                    # New Gemini models can be absent from LiteLLM's offline
+                    # capability catalog. Use its actual Gemini translator and
+                    # native request body rather than dropping the requested effort.
+                    from litellm.llms.gemini.chat.transformation import GoogleAIStudioGeminiConfig
+
+                    thinking = GoogleAIStudioGeminiConfig().map_openai_params(
+                        {"reasoning_effort": options.pop("reasoning_effort")}, {},
+                        model=d.model, drop_params=False,
+                    )["thinkingConfig"]
+                    provider_options["extra_body"] = {"generationConfig": {"thinkingConfig": thinking}}
             if d.provider == "openrouter":
                 # Keep upstream endpoint fallbacks disabled: application owns attempts.
                 provider_options["extra_body"] = {
@@ -357,6 +371,17 @@ class CompletionService:
             diagnostics = d.diagnostics
             diagnostics["failure_stage"] = stage
             diagnostics["exception_type"] = type(exc).__name__
+            if stage == "response_validation" and hasattr(exc, "validator"):
+                def leaves(error):
+                    children = getattr(error, "context", [])
+                    return [leaf for child in children for leaf in leaves(child)] if children else [error]
+                errors = sorted(leaves(exc), key=lambda item: len(item.absolute_path), reverse=True)
+                # Schema locations/validator names only: never echo provider
+                # response values or exception messages containing user data.
+                diagnostics["validation_errors"] = [
+                    {"path": list(item.absolute_path), "keyword": item.validator}
+                    for item in errors[:5]
+                ]
             if access:
                 diagnostics["access_error"] = access
             headers = (
@@ -389,7 +414,8 @@ class CompletionService:
                 self.ledger.mark_unavailable(d)
             # Never copy provider exception messages, request bodies, or credentials.
             transient = (
-                not isinstance(exc, RoutingError)
+                stage == "provider_request"
+                and not isinstance(exc, RoutingError)
                 and (
                     status in (408, 429, 500, 502, 503, 504)
                     or isinstance(exc, (ConnectionError, httpx.TransportError))
@@ -416,7 +442,8 @@ class CompletionService:
                 retry,
                 transient=transient,
                 failover=not enforcement
-                and (unavailable or denied or transient or stage == "response_validation"),
+                and (unavailable or denied or transient or stage == "response_validation"
+                     or type(exc).__name__ == "UnsupportedParamsError"),
             ) from None
         finally:
             self.strategy.selection.reset(token)

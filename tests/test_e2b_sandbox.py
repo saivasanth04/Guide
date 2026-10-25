@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import shutil
+import shlex
 from types import SimpleNamespace
 
 import pytest
@@ -68,12 +69,14 @@ def test_install_precedes_execution_and_tracks_requirement_changes(tmp_path):
     assert json.loads(executor.execute("python app.py"))["success"]
     assert [command for command, _ in calls] == [
         "python -m pip install -r requirements.txt",
-        "python app.py",
+        "bash -e -o pipefail -c " + shlex.quote("python app.py"),
     ]
     calls.clear()
     source.write_text("print(2)")
     executor.execute("python app.py")
-    assert [command for command, _ in calls] == ["python app.py"]
+    assert [command for command, _ in calls] == [
+        "bash -e -o pipefail -c " + shlex.quote("python app.py")
+    ]
     calls.clear()
     requirements.write_text("example==2\n")
     executor.execute("python app.py")

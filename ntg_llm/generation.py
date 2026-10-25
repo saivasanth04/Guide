@@ -1,6 +1,7 @@
 """Google-style text inputs translated to the existing provider-neutral router."""
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from typing import Literal
 
 from .errors import RoutingError
 
@@ -15,6 +16,7 @@ class GenerationParameters(BaseModel):
     stop_sequences: list[str] | None = None
     presence_penalty: float | None = Field(default=None, ge=-2, le=2)
     frequency_penalty: float | None = Field(default=None, ge=-2, le=2)
+    reasoning_effort: Literal["low", "medium", "high"] | None = None
 
 
 def _object(value):
