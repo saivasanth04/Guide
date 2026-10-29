@@ -7,6 +7,8 @@ import shlex
 import posixpath
 import re
 import uuid
+import os
+import textwrap
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
@@ -16,7 +18,7 @@ from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, ConfigDict, Field, create_model
 
 from e2b_sandbox import E2BSandboxExecutor, SandboxCommandInput
-from ntg_llm.agent_protocol import build_react_agent, context_text
+from ntg_llm.agent_protocol import build_react_agent, context_text, TEXT_RESPONSE_PROTOCOL
 from ntg_llm.errors import RoutingError
 
 
@@ -62,6 +64,9 @@ Rules:
 - For run_test_file provide runner as an executable/flags array and cwd as a
   project directory relative to sandbox_cwd. The tool appends the saved test's
   absolute path itself. Do not put test filenames or path placeholders in runner.
+- Saved tests receive NTG_WORKSPACE_ROOT (absolute sandbox workspace) and
+  NTG_TEST_CWD (absolute chosen cwd). Resolve source paths from those values
+  BEFORE changing directory or creating disposable data/project copies.
 - You have read-only project tools and a restricted test-file writer. Never
   implement, repair, delete, or modify project source or existing tests. Save test
   files through write_test_file; keep runtime data and artifacts in temporary
@@ -81,25 +86,19 @@ Rules:
 - For a FAIL, optionally set failure_kind to verification for a broken harness or
   infrastructure for unavailable execution. Use implementation only for demonstrated
   application behavior failures. Never label a test setup failure as a product defect.
-- Return one Action and schema-matching JSON Action Input, then wait for the real
-  observation. Do not invent observations or wrap arguments in Markdown fences.
-
-Action: selected_tool_name
-Action Input: {{}}
-
-When finished, return exactly this JSON shape after Final Answer, with status
-PASS or FAIL and a concise explanation. Execution evidence is attached by the system.
-Final Answer: {{"status": "PASS", "summary": "behavior tested and outcome"}}
+{response_protocol}
+Your final result is a verdict with status PASS or FAIL, summary, and failure_kind
+for a failure. Execution evidence is attached by the engine, never authored by you.
 
 Verification request:
 {input}
 
 {agent_scratchpad}
-""")
+""").partial(response_protocol=TEXT_RESPONSE_PROTOCOL)
 
 
 class Verdict(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     status: Literal["PASS", "FAIL"]
     summary: str = Field(min_length=1)
     failure_kind: Literal["implementation", "verification", "infrastructure"] = "implementation"
@@ -109,11 +108,154 @@ class VerificationResult(Verdict):
     evidence: list[dict] = Field(default_factory=list)
     test_files: list[str] = Field(default_factory=list)
     diagnostics: dict | None = None
+    coverage_audits: list[dict] = Field(default_factory=list)
 
 
 class CoverageAudit(BaseModel):
     model_config = ConfigDict(extra="forbid")
     missing_checks: list[str]
+
+
+class CoverageSupport(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    criterion_id: str
+    source: str = Field(min_length=1, description="An exact key from evidence_sources")
+    quote: str = Field(min_length=1, description="Copy the assertion AND setup needed to establish the obligation, not just the invocation")
+    reasoning: str = Field(min_length=1, description="Identify asserted outcomes and any untested clauses; a matching quote is not proof of sufficiency")
+
+
+class EvidenceCoverageAudit(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    supports: list[CoverageSupport]
+    missing_checks: list[str]
+
+
+def coverage_sources(details):
+    """Build citation targets from engine-observed artifacts, never model claims."""
+    sources = {"test:" + path: content for path, content in details["tests"].items()}
+    sources["response:coder"] = details["coder_response_and_observations"]
+    sources["inspection:inventory"] = json.dumps(details["project_files"], indent=2)
+    sources.update(details.get("project_artifacts", {}))
+    sources.update({f"inspection:{index}": context_text(item["observation"])
+                    for index, item in enumerate(details["inspection"])
+                    if item["tool"] in READ_ONLY_TOOLS})
+    sources.update({f"execution:{index}": context_text(item)
+                    for index, item in enumerate(details["execution_evidence"])})
+    return sources
+
+
+def project_artifact_evidence(workspace, inventory, *, budget_bytes=32_768):
+    """Read bounded text evidence from the executor's credential-filtered inventory.
+
+    Shallow files are considered first without assuming filenames, extensions or
+    languages. Oversized/binary inputs are omitted, not silently truncated into
+    apparently complete evidence. MCP inspection remains available for other files.
+    """
+    root = Path(workspace).resolve()
+    sources = {}
+    remaining = budget_bytes
+    for relative in sorted(inventory, key=lambda name: (len(PurePosixPath(name).parts), name)):
+        path = root / relative
+        try:
+            if path.is_symlink() or not path.resolve().is_relative_to(root) or path.name.startswith(".env"):
+                continue
+            size = path.stat().st_size
+            if size > min(8192, remaining):
+                continue
+            content = path.read_bytes()
+            if len(content) > min(8192, remaining) or b"\0" in content:
+                continue
+            text = content.decode("utf-8")
+        except (OSError, UnicodeError):
+            continue
+        sources["inspection:file:" + relative] = text
+        remaining -= len(content)
+    return sources
+
+
+def quote_matches_source(quote, source):
+    """Allow blank-line whitespace and common indentation, preserving code structure."""
+    quote = re.sub(r"(?m)^[ \t]+$", "", quote.replace("\r\n", "\n"))
+    source = re.sub(r"(?m)^[ \t]+$", "", source.replace("\r\n", "\n"))
+    quote = textwrap.dedent(quote).strip()
+    if quote in source:
+        return True
+    expected = textwrap.dedent(quote)
+    lines = source.splitlines()
+    length = len(quote.splitlines())
+    return any(textwrap.dedent("\n".join(lines[index:index + length])).strip() == expected
+               for index in range(len(lines) - length + 1))
+
+
+def coverage_citation_errors(audit, criteria, sources):
+    """Return actionable audit defects separately from missing test coverage."""
+    errors = {}
+    allowed = {"behavior": {"test"}, "artifact": {"test", "inspection", "execution"},
+               "response": {"response"}}
+    for key, criterion in criteria.items():
+        if key in audit.missing_checks:
+            continue
+        supports = [item for item in audit.supports if item.criterion_id == key]
+        problems = []
+        if not supports:
+            problems.append("No supporting citation; mark missing or cite observed evidence")
+        elif not any(item.source.split(":", 1)[0] in allowed[criterion["kind"]] for item in supports):
+            problems.append("Wrong evidence kind; required: " + ", ".join(sorted(allowed[criterion["kind"]])))
+        for item in supports:
+            if item.source not in sources:
+                problems.append(f"Unknown evidence source: {item.source}")
+            elif not quote_matches_source(item.quote, sources[item.source]):
+                problems.append(f"Quotation not found in {item.source}; copy actual text, do not paraphrase")
+        if problems:
+            errors[key] = problems
+    return errors
+
+
+def grounded_coverage_gaps(audit, criteria, sources):
+    """Uncited, invented or wrong-kind evidence cannot establish coverage.
+
+    Citation grounding is deterministic. Whether real assertions are sufficient
+    remains a model judgment; the recorded reasoning makes that judgment auditable.
+    """
+    audit = EvidenceCoverageAudit.model_validate(audit.model_dump())
+    if set(audit.missing_checks) - set(criteria) or any(
+        support.criterion_id not in criteria for support in audit.supports
+    ):
+        raise ValueError("Coverage audit referenced an unknown criterion")
+    gaps = set(audit.missing_checks) | set(coverage_citation_errors(audit, criteria, sources))
+    return [key for key in criteria if key in gaps]
+
+
+async def audit_with_citation_corrections(llm, prompt, criteria, sources, *, verbose=False):
+    """Repair an audit's references without rewriting or rerunning accepted tests."""
+    identifier = Literal[tuple(criteria)]
+    support_model = create_model("ActiveCoverageSupport", __base__=CoverageSupport,
+                                 criterion_id=(identifier, ...),
+                                 source=(Literal[tuple(sources)], ...))
+    audit_model = create_model("CoverageReview", __base__=EvidenceCoverageAudit,
+                               missing_checks=(list[identifier], ...),
+                               supports=(list[support_model], ...))
+    records = []
+    correction = ""
+    for attempt in range(3):
+        audit = await llm.review_coverage(prompt + correction, audit_model)
+        errors = coverage_citation_errors(audit, criteria, sources)
+        missing = grounded_coverage_gaps(audit, criteria, sources)
+        records.append({"active_criteria": criteria, **audit.model_dump(),
+                        "validated_missing_checks": missing, "citation_errors": errors})
+        if not errors or not audit.supports or attempt == 2:
+            return audit, records
+        if verbose:
+            print(f"[Tester] Audit citation correction {attempt + 1}/2: "
+                  + "; ".join(errors), flush=True)
+        correction = "\nAudit correction required:\n" + context_text(errors) + (
+            "\nCorrect ONLY the audit citations using the supplied evidence_sources. "
+            "Use the allowed source key and copy an actual supporting passage. "
+            "Do not propose new tests or change requirements to fix a quotation. "
+            "If the available evidence does not establish a criterion, mark it missing. "
+            "Return the complete corrected audit, preserving all genuine coverage gaps."
+        )
+    raise RuntimeError("Coverage audit did not complete")
 
 
 class TestArtifact(BaseModel):
@@ -138,12 +280,30 @@ class TestPlan(BaseModel):
     files: list[TestArtifact] = Field(min_length=1)
 
 
+def validate_test_plan(plan):
+    """Validate the entire plan before any file can overwrite another artifact."""
+    destinations = []
+    for artifact in [*plan.support_files, *plan.files]:
+        path = artifact.path.replace("\\", "/")
+        relative = PurePosixPath(path)
+        if not relative.parts or relative.is_absolute() or ":" in relative.parts[0] or ".." in relative.parts:
+            raise ValueError("Test artifact paths must be relative files without parent traversal")
+        canonical = PurePosixPath(os.path.normcase(relative.as_posix()).replace("\\", "/"))
+        if any(canonical.is_relative_to(other) or other.is_relative_to(canonical) for other in destinations):
+            raise ValueError("Test artifact paths must be distinct and cannot overlap")
+        destinations.append(canonical)
+    for artifact in plan.files:
+        path = PurePosixPath(artifact.path.replace("\\", "/"))
+        if any(part.replace("\\", "/") in {path.as_posix(), path.name} for part in artifact.runner):
+            raise ValueError("runner must contain executable/flags only; the engine appends the test path")
+
+
 class FailureClassification(Verdict):
     status: Literal["FAIL"] = "FAIL"
 
 
 class AcceptanceCriterion(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     quote: str = Field(min_length=1)
     expected: str = Field(min_length=1)
     kind: Literal["behavior", "artifact", "response"] = "behavior"
@@ -166,6 +326,12 @@ Derive expected results from the user's requirements, NEVER from existing bugs.
 Cover every requested behavior, empty/default states, persistence/state preservation, useful failures,
 numeric exactness and domain boundaries where relevant, including non-finite inputs.
 Choose the test language, runner, filenames and cwd from the actual project.
+Assert required behavior rather than an invented presentation format. Discover
+the real interface and compare semantic values; do not require an exact delimiter,
+whitespace layout or message unless the task explicitly requires it.
+When the task leaves a policy unspecified, test the implementation's consistent
+choice rather than imposing a convention (for example, a rounding tie-break rule).
+Distinguish deliberate rounding to the requested precision from arithmetic error.
 Use available project tools or standard-library runners where appropriate. If a
 suite needs extra packages, declare them in support_files using dependency
 manifests supported by the existing executor. They install automatically before
@@ -174,6 +340,14 @@ the chosen cwd. Do not assume an undeclared third-party runner is preinstalled.
 Use actual assertions, not printed success messages. Never modify production files.
 Use temporary data directories or disposable project copies to isolate tests.
 Preserve existing valid assertions when revising tests after a coverage review.
+For rejection requirements, separately assert the exit code, useful diagnostic,
+and preservation of PRE-EXISTING valid state when requested. An empty database
+remaining empty does not prove preservation of existing records. When numbers
+are involved, include invalid text and non-finite/domain boundary inputs as
+appropriate; a traceback is not a useful application error. Demonstrate requested
+numeric exactness with values that distinguish it from approximate arithmetic.
+Do not delete application data in the project cwd in setUp/tearDown: run a
+disposable project copy or configure an isolated temporary data location.
 
 Return a TestPlan as your final response, NOT a PASS/FAIL claim. It must contain
 complete executable test-file contents and a list of the requirements asserted.
@@ -190,16 +364,24 @@ cwd is relative to sandbox_cwd and must agree with relative paths inside the tes
 Choose cwd BEFORE writing code. Paths inside tests resolve from cwd, not from the
 saved test-file directory. Build project paths from authoritative sandbox_cwd and
 project_files; never guess a parent directory.
+The engine sets NTG_WORKSPACE_ROOT to the absolute sandbox workspace and
+NTG_TEST_CWD to the absolute chosen cwd for the test process. Use these environment
+values to resolve input source paths BEFORE changing cwd into any temporary
+directory. Copy needed source files using absolute paths, then execute the copy.
+Test paths are your own relative artifact names; do not reuse engine-added version
+prefixes from older observations. Every artifact path must be distinct. runner
+contains executable and flags only: never include the test filename yourself.
 The saved test file is outside the project directory, so configure imports/cwd
 explicitly. For expected application errors, assert the child exit code/output
 inside a suite that exits zero when those assertions pass.
 If inspection is needed, request one tool using its actual JSON argument object.
 When ready, finish with the structured TestPlan required by the response schema.
+{response_protocol}
 
 Verification request:
 {input}
 {agent_scratchpad}
-""")
+""").partial(response_protocol=TEXT_RESPONSE_PROTOCOL)
 
 
 class TesterAgent:
@@ -301,12 +483,16 @@ class TesterAgent:
             staging_directory = posixpath.join(directory, namespace)
             expanded = ("mkdir -p " + shlex.quote(staging_directory)
                         + " && cp -R " + shlex.quote(remote_tests + "/.") + " " + shlex.quote(staging_directory)
-                        + " && cd " + shlex.quote(directory) + " && " + shlex.join([*runner, staged]))
+                        + " && cd " + shlex.quote(directory)
+                        + " && env NTG_WORKSPACE_ROOT=" + shlex.quote(remote)
+                        + " NTG_TEST_CWD=" + shlex.quote(directory)
+                        + " " + shlex.join([*runner, staged]))
             digest = hashlib.sha256(test_files[path].read_bytes()).hexdigest()
             await execute(expanded, timeout_seconds)
             evidence[-1]["test_file"] = str(test_files[path])
             evidence[-1]["test_path"] = path
             evidence[-1]["cwd"] = directory
+            evidence[-1]["test_environment"] = {"NTG_WORKSPACE_ROOT": remote, "NTG_TEST_CWD": directory}
             evidence[-1]["test_sha256"] = digest
             return json.dumps(evidence[-1])
 
@@ -471,9 +657,20 @@ class TesterAgent:
             extraction = (
                 "Extract EVERY observable acceptance criterion from the original task into atomic checks. "
                 "For each, copy an EXACT quote from the task and state its expected behavior. "
-                "Classify behavior (runtime functionality), artifact (files/documentation), or "
+                "Split conjunctions into separately checkable obligations: e.g. rejecting input, "
+                "providing useful diagnostics, and preserving pre-existing state are distinct checks. "
+                "Do not merge all of those into a single vague validation criterion. "
+                "For requested numeric input validation, enumerate separate domain-invalid input "
+                "classes (invalid text, non-finite values, zero/negative values where excluded) "
+                "as distinct criteria, grounded in the task's actual domain. Reuse the same exact "
+                "task quote for those distinct checks when necessary. Do not infer that testing "
+                "a negative value also tests malformed text or non-finite input. Only require "
+                "rejection where those inputs are invalid for the requested domain. "
+                "Classify behavior (runtime functionality), artifact (files/documentation/workspace preservation), or "
                 "response (the Coder's final reply/instructions). "
                 "Do not invent robustness, concurrency, corruption, or other features not requested. "
+                "Do not add storage-location, output-format or framework constraints absent from the task. "
+                "For example, a request for a local file does not require it to live beside the executable. "
                 "Ignore the system environment context, which is not a requirement. "
                 "No project source or prior tests should define this contract.\nOriginal task:\n" + task
             )
@@ -494,8 +691,12 @@ class TesterAgent:
             print(f"[Tester] Frozen acceptance criteria: {contract_path}", flush=True)
         approved = set()
         retained = []
+        coverage_audits = []
+        inspections = []
+        project_artifacts = project_artifact_evidence(self.workspace, inventory)
         context = {"task": task, "coder_summary": coder_output, "project_files": inventory[:500],
                    "inventory_truncated": len(inventory) > 500,
+                   "observed_project_artifacts": project_artifacts,
                    "sandbox_cwd": getattr(executor, "remote_workspace", E2BSandboxExecutor.DEFAULT_REMOTE_WORKSPACE)}
         verdict = Verdict(status="FAIL", summary="Test planning did not complete", failure_kind="verification")
         for attempt in range(3):
@@ -504,8 +705,6 @@ class TesterAgent:
             identifier = Literal[tuple(pending)]
             plan_schema = create_model("ActiveTestPlan", __base__=TestPlan,
                                        coverage=(list[identifier], Field(min_length=len(pending))))
-            audit_schema = create_model("CoverageReview", __config__=ConfigDict(extra="forbid"),
-                                        missing_checks=(list[identifier], ...))
             planner = AgentExecutor(
                 agent=build_react_agent(self.llm, self.filesystem_tools,
                                        PLAN_PROMPT.partial(workspace=self.workspace),
@@ -515,8 +714,11 @@ class TesterAgent:
             )
             start = len(evidence)
             result = await planner.ainvoke({"input": context_text(context)})
+            inspections.extend({"tool": action.tool, "arguments": action.tool_input, "observation": observation}
+                               for action, observation in result.get("intermediate_steps", []))
             try:
                 plan = TestPlan.model_validate_json(result["output"])
+                validate_test_plan(plan)
                 if set(plan.coverage) != set(pending):
                     raise ValueError("The test plan must cover exactly the active criterion IDs")
                 versioned = []
@@ -544,8 +746,8 @@ class TesterAgent:
                            "coder_response_and_observations": coder_output,
                            "tests": {path: test_files[path].read_text(encoding="utf-8") for path, _ in versioned},
                            "execution_evidence": current, "project_files": inventory,
-                           "inspection": [{"tool": action.tool, "arguments": action.tool_input, "observation": observation}
-                                          for action, observation in result.get("intermediate_steps", [])]}
+                           "project_artifacts": project_artifacts,
+                           "inspection": inspections}
                 if any(item.get("source_changes") for item in evidence):
                     verdict = Verdict(status="FAIL", summary="Tester changed synchronized project files", failure_kind="verification")
                     break
@@ -564,14 +766,19 @@ class TesterAgent:
                         "a missing test runner/package is a correctable verification setup error, not unavailable infrastructure. "
                         "Correct it with a dependency manifest in support_files or an available runner. "
                         "use infrastructure for unavailable execution. Expected outcomes come from the task, "
-                        "not the current source. Validate the assertion logic and expected value themselves "
+                        "not the current source. Where the task leaves a policy unspecified, a consistent "
+                        "implementation choice is valid; an assertion imposing a convention is a verification "
+                        "error. For example, decimal half-even and half-up are both valid unless a rounding "
+                        "tie-break rule is required; a rounded tie alone does not show truncation or loss of "
+                        "decimal exactness. Validate the assertion logic and expected value themselves "
                         "before blaming production. Never weaken valid assertions. Return FAIL and concrete evidence.\n"
                         + context_text(details), FailureClassification,
                     )
                     if verdict.failure_kind != "verification":
                         break
                 else:
-                    audit = await self.llm.review_coverage(
+                    sources = coverage_sources(details)
+                    audit, audit_records = await audit_with_citation_corrections(self.llm,
                         "Audit executed test SOURCE only against the supplied ACTIVE frozen criteria. "
                         "For artifact criteria use actual file inspection as well as tests; for response "
                         "criteria inspect the supplied Coder response. Do not demand CLI output for "
@@ -581,23 +788,58 @@ class TesterAgent:
                         "or stronger guarantees may be added. Previously approved criteria are retained and "
                         "rerun independently; do not reopen them. Distinct application process launches "
                         "inside one suite count as separate invocations; recognize assertions that already "
-                        "establish a property. Return missing_checks=[] only when tests meaningfully cover the task.\n"
-                        + context_text(details), audit_schema,
+                        "establish a property. For EACH claimed covered criterion provide supports containing "
+                        "its criterion_id, an exact evidence_sources key, an exact quote copied from that source, "
+                        "and reasoning identifying the required outcomes actually asserted. Behavioral claims "
+                        "must cite executed test SOURCE assertions; Coder claims, library names, imports, "
+                        "and exit zero alone are not behavioral proof. Use response:coder only for response "
+                        "criteria; artifact criteria need actual inspection, tests or integrity observations. "
+                        "Check EVERY clause in compound criteria. Rejection tests must assert useful diagnostics "
+                        "and preservation of seeded existing state when requested, not merely exit != 0 on an "
+                        "empty store. For numeric validation examine invalid text, non-finite and relevant "
+                        "boundaries; an uncaught traceback is not a useful error. Decimal-looking happy-path "
+                        "values alone do not establish requested numeric exactness. Do not add unrelated scope. "
+                        "Mark a criterion missing if any requested obligation lacks an assertion. "
+                        "Return missing_checks=[] only when every active criterion has sufficient cited evidence.\n"
+                        + context_text({
+                            "task": task, "active_criteria": pending, "project_files": inventory,
+                            "inspection_manifest": [{"source": f"inspection:{index}",
+                                                     "tool": item["tool"], "arguments": item["arguments"]}
+                                                    for index, item in enumerate(details["inspection"])],
+                            "evidence_sources": sources,
+                        }), pending, sources, verbose=self.verbose,
                     )
-                    newly_approved = set(pending) - set(audit.missing_checks)
+                    missing = audit_records[-1]["validated_missing_checks"]
+                    coverage_audits.extend(audit_records)
+                    for audit_index, record in enumerate(audit_records):
+                        suffix = "" if audit_index == 0 else f"_correction_{audit_index}"
+                        (test_root / f"coverage_audit_{attempt + 1}{suffix}.json").write_text(
+                            json.dumps(record, indent=2), encoding="utf-8"
+                        )
+                    missing_response = [key for key in audit.missing_checks
+                                        if pending[key]["kind"] == "response"]
+                    if missing_response:
+                        verdict = Verdict(
+                            status="FAIL", failure_kind="implementation",
+                            summary="Missing requested Coder response: " + "; ".join(
+                                f"{key}: {pending[key]['expected']}" for key in missing_response),
+                        )
+                        break
+                    newly_approved = set(pending) - set(missing)
                     approved.update(newly_approved)
                     if newly_approved:
                         retained.extend(versioned)
                     if self.verbose:
                         print(f"[Tester] Accepted criteria: {len(approved)}/{len(criteria)}", flush=True)
-                    if not audit.missing_checks:
+                    if not missing:
                         verdict = Verdict(status="PASS", summary=f"Executed {len(current)} independent test suite(s); all passed and coverage review found no missing requested behavior.")
                         break
-                    verdict = Verdict(status="FAIL", summary="Missing behavioral checks: " + "; ".join(f"{key}: {criteria[key]['expected']}" for key in audit.missing_checks), failure_kind="verification")
+                    verdict = Verdict(status="FAIL", summary="Missing or ungrounded coverage: " + "; ".join(f"{key}: {criteria[key]['expected']}" for key in missing), failure_kind="verification")
             context.update({"verification_correction": verdict.summary, "execution_evidence": evidence[start:],
                             "previous_test_files": {path: file.read_text(encoding="utf-8") for path, file in test_files.items()},
                             "instruction": "Submit a COMPLETE revised TestPlan that fixes the reported harness or assertion gaps. The engine will save and execute it automatically. Preserve all existing valid requirements/assertions."})
             if self.verbose and attempt < 2:
                 print(f"[Tester] Verification correction {attempt + 1}/2: {verdict.summary}", flush=True)
         return VerificationResult(**verdict.model_dump(), evidence=evidence,
-                                  test_files=[str(path) for path in test_files.values()])
+                                  test_files=[str(path) for path in test_files.values()],
+                                  coverage_audits=coverage_audits)

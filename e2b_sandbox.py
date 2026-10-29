@@ -5,6 +5,7 @@ import hashlib
 import os
 import shlex
 import warnings
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -292,6 +293,7 @@ class E2BSandboxExecutor:
         *,
         protect_source: bool = False,
     ) -> str:
+        started = time.perf_counter()
         sandbox = None
         synced_files = 0
         stage = "workspace_setup"
@@ -383,6 +385,7 @@ class E2BSandboxExecutor:
                 payload["success"] = False
                 payload["error"] = f"Source integrity verification failed: {type(error).__name__}"
 
+        payload["elapsed_seconds"] = round(time.perf_counter() - started, 3)
         return json.dumps(
             payload,
             indent=2,

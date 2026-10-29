@@ -62,6 +62,9 @@ def response_schema(response_model):
 
         def close(node):
             if isinstance(node, dict):
+                # Gemini supports enum; Pydantic emits const for singleton Literals.
+                if "const" in node:
+                    node["enum"] = [node.pop("const")]
                 if node.get("type") == "object":
                     if "properties" not in node or node.get("additionalProperties") not in (
                         None,

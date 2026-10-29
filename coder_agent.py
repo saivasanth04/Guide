@@ -9,6 +9,7 @@ from dotenv import dotenv_values
 from e2b_sandbox import E2BSandboxExecutor
 from agent_orchestrator import repair_limit, run_workflow
 from tester_agent import TesterAgent
+from reviewer_agent import ReviewerAgent
 from langchain_classic.agents import (
     AgentExecutor,
 )
@@ -19,7 +20,7 @@ from langchain_mcp_adapters.client import (
 )
 
 from ntg_llm import LLMClient, LLMError
-from ntg_llm.agent_protocol import build_react_agent
+from ntg_llm.agent_protocol import build_react_agent, TEXT_RESPONSE_PROTOCOL
 from agent_orchestrator import has_successful_execution
 from ntg_llm.langchain_adapter import NTGLangChainLLM
 
@@ -91,22 +92,15 @@ Working principles:
   For numeric domains consider finite values, precision, rounding and domain limits.
   Expected failures must be asserted explicitly; do not hide exit codes with trailing
   print/echo commands. Keep documented commands consistent with the files you create.
+  For requested input rejection, assert useful diagnostics as well as nonzero exit;
+  an uncaught traceback is not controlled validation. If rejected operations must
+  preserve state, seed valid existing state and compare it after rejection.
 
 Response protocol:
 
-- Return exactly one tool action or one final answer per response.
-- For an action, replace the tool name and empty object below with the selected
-  tool and its actual JSON arguments:
-
-Action: tool_name
-Action Input: {{}}
-
-- Action Input must be a JSON object matching the selected tool's schema.
-- Do not wrap arguments in Markdown fences or invent Observation text.
-- Wait for the real tool observation before choosing the next action.
-- When finished, use:
-
-Final Answer: outcome, relevant verification, and any remaining limitations
+{response_protocol}
+Your final result must describe the implemented outcome, actual verification,
+project location, usage instructions when requested, and remaining limitations.
 
 Task:
 
@@ -114,7 +108,7 @@ Task:
 
 {agent_scratchpad}
 """
-)
+).partial(response_protocol=TEXT_RESPONSE_PROTOCOL)
 
 
 # --------------------------------------------------
@@ -216,6 +210,7 @@ async def main(workspace: str | Path | None = None, task: str | None = None,
         client=ntg_client,
         model_name=setting("CODER_MODEL", "router"),
         trace_routing=True,
+        agent_role="coder",
         structured_actions=True,
         reasoning_effort=setting("CODER_REASONING_EFFORT", setting("AGENT_REASONING_EFFORT")),
     )
@@ -249,10 +244,17 @@ async def main(workspace: str | Path | None = None, task: str | None = None,
 
         agent = create_coder_agent(llm, tools, workspace)
         tester_llm = llm.model_copy(update={
+            "agent_role": "tester",
             "model_name": setting("TESTER_MODEL", "router"),
             "reasoning_effort": setting("TESTER_REASONING_EFFORT", setting("AGENT_REASONING_EFFORT")),
         })
         tester = TesterAgent(tester_llm, filesystem_tools, workspace, verbose=True)
+        reviewer_llm = llm.model_copy(update={
+            "agent_role": "reviewer",
+            "model_name": setting("REVIEWER_MODEL", "router"),
+            "reasoning_effort": setting("REVIEWER_REASONING_EFFORT", setting("AGENT_REASONING_EFFORT")),
+        })
+        reviewer = ReviewerAgent(reviewer_llm, filesystem_tools, workspace, verbose=True)
 
         # ----------------------------------------------
         # Task
@@ -264,7 +266,7 @@ async def main(workspace: str | Path | None = None, task: str | None = None,
             "workspace": workspace, "existing_project_files": inventory[:500],
             "inventory_truncated": len(inventory) > 500,
         }) + "\nUse this authoritative inventory to avoid redundant directory discovery."
-        result = await run_workflow(task, agent, tester, max_repair_attempts=limit)
+        result = await run_workflow(task, agent, tester, reviewer, max_repair_attempts=limit)
 
         print("\nFinal Result:")
         print(result.model_dump_json(indent=2))

@@ -1,6 +1,6 @@
 # Routed generation with a Google-style client interface
 
-Run the complete Coder → Tester → repair workflow through one entry point:
+Run the complete Coder → Tester → Reviewer → repair workflow through one entry point:
 
 ```powershell
 python coder_agent.py
@@ -16,9 +16,10 @@ inspection and repair capabilities through the same entry point.
 Programmatic `main(workspace=...)` uses the explicitly supplied directory as-is
 for continuing work on an existing project.
 
-`CODER_MODEL` and `TESTER_MODEL` optionally select configured models (both default
-to `router`). `AGENT_REASONING_EFFORT=low` controls supported reasoning models;
-`CODER_REASONING_EFFORT` and `TESTER_REASONING_EFFORT` override it per role.
+`CODER_MODEL`, `TESTER_MODEL` and `REVIEWER_MODEL` optionally select configured models
+(all default to `router`). `AGENT_REASONING_EFFORT=low` controls supported reasoning models;
+`CODER_REASONING_EFFORT`, `TESTER_REASONING_EFFORT` and `REVIEWER_REASONING_EFFORT`
+override it per role.
 Leave these effort settings unset for providers without reasoning support.
 
 The library also supports direct generation calls:
@@ -65,7 +66,7 @@ Budget exhaustion raises a sanitized 504 with attempt diagnostics. Round-robin
 selection and specific-model scoping remain unchanged.
 
 Install coding-agent dependencies with `python -m pip install -e ".[dev,agent]"`.
-The coding workflow runs a fully capable Coder followed by an independent Tester:
+The coding workflow runs a fully capable Coder, independent Tester, then independent Reviewer:
 
 ```powershell
 python coder_agent.py
@@ -127,24 +128,70 @@ Before accepting PASS, the live Tester audits the saved test source and executio
 evidence against the original task. Missing behavioral assertions are sent back
 for test expansion within the same bounded verification corrections. This is a
 model-assisted coverage review, not a mathematical guarantee of complete coverage.
+The default structured coverage audit must cite exact test/inspection/reply evidence
+for each claimed covered criterion. The engine rejects ungrounded quotations,
+missing citations and inappropriate evidence types. Audit records are retained in
+`coverage_audits` and under `.agent_tests`; real quotations still require judgment
+about whether the assertions are sufficient.
+Citation-only mistakes receive at most two audit corrections against the same
+executed tests before they can remain a gap; they do not trigger test regeneration
+or consume Coder repairs. Common block indentation/line endings are normalized
+without ignoring relative code structure. The catalog includes bounded observed
+text artifacts and preserves read-only inspections across planning corrections.
 Saved tests changed after execution must be rerun. Sandbox commands use Bash
 `errexit` and `pipefail`, so trailing `echo` commands and pipeline consumers do not
 hide failures. Handle expected failures with assertions or explicit conditionals.
 Entry-point logs include routed provider/model and attempt count. Tester logs show
 actual execution observations, not unvalidated model PASS claims.
+LLM traces also identify the role, elapsed seconds and success/failure. Sandbox
+observations include elapsed seconds for the entire executor call; Reviewer logs
+its read-only inspection tools and arguments. Before writing a structured TestPlan,
+the engine rejects duplicate/overlapping artifact paths, parent traversal and
+runner arguments that repeat the test filename. Test processes receive absolute
+`NTG_WORKSPACE_ROOT` and `NTG_TEST_CWD` environment values for locating source
+before changing into temporary directories.
 See [the reliability review](docs/verification-review.md) for findings and limits.
+See [the supplied-run review](docs/log-review-2026-10-25.md) for reproduced false
+confidence, measured outcomes and remaining model-quality limits.
+See [the failed-flow analysis](docs/flow-review-2026-10-26.md) for per-stage failure
+ownership, citation recovery and validation of the latest repairs.
+
+The Reviewer runs only after authoritative Tester PASS and uses the existing LLM
+router and agent protocol with read-only MCP filesystem tools. It inspects actual
+project content for requirement completeness, correctness missed by tests, design,
+maintainability, unnecessary complexity and visible security/reliability problems.
+It has no editing, test-writing or command-execution tools and does not rerun the
+Tester's behavioral suites. It receives the original task, latest Coder summary
+(a claim, not proof), full Tester result and execution evidence, and saved test paths.
+Minor suggestions permit APPROVE; REJECT requires at least one major or critical
+issue with concrete source evidence. Invalid review output, missing content
+inspection, iteration exhaustion or routing failures stop the workflow as review
+failures instead of requesting production changes.
 
 Set `MAX_REPAIR_ATTEMPTS=3` in `.env` (default). This permits the initial implementation plus at most
 three Coder repairs and four Tester rounds; individual test commands do not
-increment the counter. Set zero to disable repairs. Exhaustion returns FAIL with
+increment the counter. Tester implementation failures and Reviewer rejections
+share this budget. Every repair goes through Tester again before any new review.
+Coder receives structured review issues and the Tester PASS evidence on review
+rejection, with explicit instructions to investigate, preserve requirements and
+leave independent test artifacts intact. Set zero to disable repairs. Exhaustion returns FAIL with
 the latest evidence and a nonzero CLI exit status. Each agent also retains a
 25-iteration limit, and the existing LLM request budgets remain in force.
 
 Final results are JSON containing status, repair count, Coder summary, latest
-Tester report, and verification history. Tester evidence comes from actual tool
+Tester report, verification history, latest current-round `reviewer` (or null),
+and `review_history`. Historical review results cannot approve a later implementation.
+Programmatic orchestration now requires `run_workflow(task, coder, tester, reviewer, ...)`;
+Reviewer implements `review(task, coder_output, tester_result)`.
+Tester evidence comes from actual tool
 observations, including command, exit code, stdout/stderr, sandbox identity,
 setup/install errors, and source changes. PASS requires executed, successful
-checks; missing evidence, malformed verdicts, or failed commands cannot pass.
+checks and Reviewer APPROVE; missing evidence, malformed verdicts, or failed commands cannot pass.
+Tester PASS alone can appear in a final workflow FAIL when review rejects or fails.
+`failure_stage` identifies the failed agent. The result contract itself rejects
+PASS unless both authoritative verdicts succeed. Reviewer source-access failures
+stop explicitly instead of manufacturing implementation rejections.
+See [Reviewer architecture and validation](docs/reviewer-workflow.md).
 
 Deterministic orchestration tests: `python -m pytest -q tests/test_agent_workflow.py`.
 Live workflow scenarios (real MCP, E2B, and the LLM adapter/router with controlled

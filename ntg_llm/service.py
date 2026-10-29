@@ -208,6 +208,8 @@ class CompletionService:
         schema = response_schema(response_model) if response_model is not None else None
         deployments = self.deployments if deployments is None else deployments
         tried, attempts = set(), []
+        last_failure = None
+        request_messages = messages
 
         def remaining():
             seconds = deadline - self.clock()
@@ -230,12 +232,20 @@ class CompletionService:
                 d = self.ledger.select(deployments, excluded=tried)
             except RoutingError as error:
                 if attempts:
+                    if last_failure is not None and error.status_code == 503:
+                        # A skipped/disabled slot can remain after every usable
+                        # deployment was tried. Keep the actual provider failure
+                        # authoritative instead of disguising 429/503/validation
+                        # failures as a new pool-selection/access problem.
+                        last_failure.diagnostics["selection_error"] = error.as_dict()
+                        last_failure.diagnostics["attempts"] = list(attempts)
+                        raise last_failure from None
                     error.diagnostics["attempts"] = attempts
                 raise
             tried.add(d.id)
             try:
                 result = self._complete_once(
-                    messages,
+                    request_messages,
                     d,
                     response_model,
                     schema,
@@ -243,6 +253,7 @@ class CompletionService:
                     timeout=min(self.request_timeout, remaining()),
                 )
             except RoutingError as error:
+                last_failure = error
                 failure = {
                     **d.diagnostics,
                     "status": error.status_code,
@@ -260,6 +271,11 @@ class CompletionService:
                 # Access enforcement remains terminal even at the deadline.
                 if not error.failover:
                     raise
+                if error.diagnostics.get("failure_stage") == "response_validation":
+                    request_messages = [*messages, {"role": "system", "content":
+                        "The previous response failed validation. Return only the requested response "
+                        "matching its format and supplied schema (if any), with required fields and types. Validation: "
+                        + json.dumps(error.diagnostics.get("validation_errors", []))}]
                 remaining()
                 if len(tried) >= min(self.max_attempts, len(deployments)):
                     raise

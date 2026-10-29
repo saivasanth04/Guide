@@ -4,11 +4,32 @@ import json
 from typing import Literal, Union
 
 from langchain_classic.agents import create_react_agent
-from langchain_classic.agents.format_scratchpad import format_log_to_str
 from langchain_core.runnables import RunnableLambda, RunnablePassthrough
 from pydantic import ConfigDict, create_model
 
 from .react_parser import parse_react_output, render_mcp_tools
+
+
+TEXT_RESPONSE_PROTOCOL = """Return exactly one tool action or one final response.
+For a tool action use:
+Action: selected_tool_name
+Action Input: a JSON object matching that tool's schema
+Wait for the actual observation. Never invent observations or wrap a tool action
+in Markdown fences. File contents and final text retain their requested formats.
+For completion use Final Answer: followed by the requested result. If the result
+is a verdict or test plan, put its JSON object after that label.
+"""
+
+STRUCTURED_RESPONSE_PROTOCOL = """Return exactly one AgentDecision JSON object
+matching the supplied response schema. For a tool action set decision.action to
+the declared tool name and decision.arguments to its actual argument object.
+For completion use decision.action=final_answer and put the requested result in
+decision.arguments.output, using its declared type. Do not use Action/Final Answer
+text labels, native function calls or Markdown fences as the response envelope.
+Fields declared as objects must be objects, not JSON-encoded strings. String
+fields such as file contents remain strings and may themselves contain JSON/code.
+Wait for actual observations and use only the available tools and completion options.
+"""
 
 
 def context_text(value):
@@ -118,7 +139,10 @@ def build_react_agent(llm, tools, prompt, *, finish_guard, final_model=str):
     adapter uses the same router but requests validated JSON, then converts it
     into canonical ReAct text. No provider-native tool API is required.
     """
-    if not getattr(llm, "structured_actions", False):
+    structured = getattr(llm, "structured_actions", False)
+    if "response_protocol" in prompt.input_variables or "response_protocol" in prompt.partial_variables:
+        prompt = prompt.partial(response_protocol=STRUCTURED_RESPONSE_PROTOCOL if structured else TEXT_RESPONSE_PROTOCOL)
+    if not structured:
         return create_react_agent(
             llm,
             tools,
@@ -142,17 +166,19 @@ def build_react_agent(llm, tools, prompt, *, finish_guard, final_model=str):
                 **inputs,
                 "input": inputs["input"]
                 + (
-                    "\nExecution stage: completion is unavailable until required sandbox evidence exists. "
-                    "Use the available tools to complete implementation/verification."
+                    "\nCompletion is unavailable until the required tool evidence exists. "
+                    "Use the available tools to complete your assigned role."
                 ),
             }
         return await guarded.ainvoke(prompt.invoke(inputs))
 
     return (
         RunnablePassthrough.assign(
-            agent_scratchpad=lambda inputs: format_log_to_str([
-                (action, observation_text(observation)) for action, observation in inputs["intermediate_steps"]
-            ])
+            agent_scratchpad=lambda inputs: "\n".join(
+                json.dumps({"decision": {"action": action.tool, "arguments": action.tool_input}})
+                + "\nTool observation:\n" + observation_text(observation)
+                for action, observation in inputs["intermediate_steps"]
+            )
         )
         | RunnableLambda(decide)
         | RunnableLambda(parse_react_output)
