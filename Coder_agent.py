@@ -1,18 +1,9 @@
-from openai import OpenAI
-from pydantic import BaseModel
+import asyncio
+
 from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
 
 from mcp_registry import get_mcp_tools
-
-import asyncio
-import json
-
-
-class ChatResponse(BaseModel):
-    answer: str
-    summary: str
-    confidence: float
 
 
 ROLE = """
@@ -42,6 +33,7 @@ async def coder_agent(user_request: str):
         model = ChatOpenAI(
             model="router",
             base_url="http://localhost:8080/v1",
+            api_key="dummy",
         )
 
         agent = create_agent(
@@ -70,9 +62,7 @@ CONTEXT:
             }
         )
 
-        final_message = result["messages"][-1]
-
-        return final_message.content
+        return result["messages"][-1].content
 
     finally:
         await adapter.__aexit__(

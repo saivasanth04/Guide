@@ -1,0 +1,25 @@
+mcp:
+  description: >
+    Shell execution tools for the Tester Agent.
+    Use this tool to run build, test, compile, lint,
+    and validation commands for software projects.
+
+  run:
+    shell: powershell.exe
+
+  tools:
+    - name: run_test_command
+      description: >
+        Execute a build, test, compile, lint, or validation command
+        required for the current project.
+
+      params:
+        command:
+          type: string
+          description: Command to execute.
+          required: true
+
+      run:
+        timeout: "5m"
+        command: |
+          {{ .command }}
