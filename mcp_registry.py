@@ -17,7 +17,20 @@ async def get_mcp_tools():
                     "@modelcontextprotocol/server-filesystem",
                     WORKSPACE,
                 ],
-            }
+            },
+             "shell": {
+                "transport": "stdio",
+                "command": "cmd",
+                "args": [
+                    "/c",
+                    "go",
+                    "run",
+                    "github.com/inercia/MCPShell@v0.1.8",
+                    "mcp",
+                    "--tools",
+                    MCPSHELL_CONFIG,
+                ],
+            },
         }
     )
 
