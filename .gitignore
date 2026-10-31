@@ -14,3 +14,5 @@ __pycache__/
 build/
 dist/
 artifacts/
+
+.shell-mcp/node_modules/

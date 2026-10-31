@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "@mako10k/mcp-shell-server": "2.8.1"
+  }
+}
