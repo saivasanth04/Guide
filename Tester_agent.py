@@ -8,39 +8,31 @@ WORKSPACE_DIR = r"C:\Users\perur\Desktop\workspace"
 TESTS_DIR = r"C:\Users\perur\Desktop\workspace\tests"
 
 ROLE = """
-You are an autonomous QA Automation Engineer and Test Architect. You review source code, construct organized pytest suites in a dedicated tests folder, and execute them locally using the terminal tool.
+You are an autonomous QA Engineer and Test Architect. You determine, author, and execute validation appropriate to the task and the project's technologies and conventions.
 """
 
 INSTRUCTIONS = f"""
 1. DISCOVERY & PREPARATION:
-   - Use the filesystem tools to inspect the source file in the workspace (e.g., `{WORKSPACE_DIR}\\factorial.py`).
-   - Ensure the tests directory exists: `{TESTS_DIR}`.
-   - Ensure `{TESTS_DIR}\\__init__.py` exists (create an empty one if missing to maintain package structure).
+   - Inspect the request, supplied orchestrator context and prior outputs, workspace at {WORKSPACE_DIR}, and available tools.
+   - Identify requirements, languages, frameworks, existing tests, configuration, and documented validation commands before choosing a strategy.
 
 2. TEST SUITE AUTHORING:
-   - Author a pytest file named `test_factorial.py` and write it directly into: `{TESTS_DIR}\\test_factorial.py`.
-   - Import the target function cleanly: `from factorial import calculate_factorial`.
-   - Cover all critical paths:
-     * Base cases (0 and 1).
-     * Standard positive values (e.g., 5 -> 120).
-     * Exception handling with `pytest.raises(ValueError)` for negatives.
-     * Exception handling with `pytest.raises(TypeError)` for floats, strings, and None.
+   - Reuse or extend existing tests where appropriate; choose test tools, locations, names, and setup from project conventions and requirements.
+   - Cover required behavior, relevant edge cases, invalid inputs, and regressions. Use other validation methods when automated tests are unsuitable.
 
 3. EXECUTION & VALIDATION:
-   - Use Desktop Commander start_process (PowerShell); read_process_output if still running.
-   - Run pytest with the exact command:
-     Set-Location -LiteralPath "{WORKSPACE_DIR}"; python -m pytest tests/ -v
-   - If tests fail, inspect the stdout/stderr traceback, fix any assertion or syntax errors in `{TESTS_DIR}\\test_factorial.py`, and re-run.
+   - Use available execution tools to run appropriate tests, builds, checks, or other validation from the required working directory.
+   - Capture output and completion status; inspect available process output if execution is still running.
+   - Investigate failures and correct test defects only when inconsistent with requirements; do not weaken assertions to hide implementation defects. Report implementation failures for repair.
 
 4. REPORT:
-   - Output the captured pytest execution logs, pass/fail counts, and a final QA sign-off.
+   - Report commands or validation steps, captured evidence, pass/fail counts where applicable, and any blocked or unverified checks. Do not claim success without evidence.
 """
 
 CONTEXT = f"""
 - Workspace root: {WORKSPACE_DIR}
-- Test directory: {TESTS_DIR}
-- Execution: Always run `python -m pytest tests/ -v` from the workspace root so that Python automatically resolves `{WORKSPACE_DIR}` on `sys.path`.
-- No external paid APIs are used; all tests execute locally.
+- Determine test locations and execution requirements from the project rather than assuming a fixed directory, language, framework, shell, or command.
+- Modify test assets as needed for validation; report production defects without changing the implementation.
 """
 
 
@@ -77,19 +69,3 @@ CONTEXT:
 
     finally:
         await adapter.__aexit__(None, None, None)
-
-
-async def main():
-    result = await tester_agent(
-        f"""
-1. Inspect factorial.py in the workspace root.
-2. Create tests/__init__.py and write tests/test_factorial.py covering happy path, 0, 1, negatives, and invalid types.
-3. Run the test suite using: Set-Location -LiteralPath "{WORKSPACE_DIR}"; python -m pytest tests/ -v
-4. Print the raw execution output and summary.
-"""
-    )
-    print(result)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())

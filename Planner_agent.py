@@ -33,6 +33,8 @@ Workspace:
 Rules:
 - Inspect the workspace before planning changes to an existing project.
 - Understand the current architecture and implementation first.
+- Determine task-specific requirements, technologies, and approach from the request,
+  supplied orchestrator context and prior outputs, workspace evidence, and available tools.
 - Do not write, modify, rename, or delete files.
 - Do not execute implementation or testing commands.
 - Do not call the Coder, Tester, or Reviewer agents.
@@ -107,8 +109,8 @@ async def planner_agent(user_request: str) -> str:
         await adapter.__aexit__(None, None, None)
 
 task = """
-Review the existing project in the workspace and plan how to add input validation
-and error handling to the current application.
+Inspect the workspace and plan the requested changes using the available project
+requirements. If the intended goal is missing or ambiguous, identify what needs clarification.
 
 Requirements:
 - Inspect the existing files and architecture first.

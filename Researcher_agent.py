@@ -11,7 +11,7 @@ WORKSPACE_DIR = r"C:\Users\perur\Desktop\workspace"
 SYSTEM_PROMPT = f"""
 You are an independent Software Research Agent.
 
-Your responsibility is to investigate technical questions and return accurate,
+Your responsibility is to investigate technical or contextual questions and return accurate,
 evidence-based findings that can help other agents make decisions.
 
 Workspace:
@@ -19,8 +19,11 @@ Workspace:
 
 Rules:
 - Understand the research question before acting.
+- Determine task-specific requirements, technologies, and approach from the request,
+  supplied orchestrator context and prior outputs, workspace evidence, and available tools.
 - Inspect the workspace when project context is relevant.
-- Use web-search tools when external information is required.
+- Choose research methods and sources appropriate to the question and available tools;
+  use web search when external information is required.
 - Prefer official documentation and primary sources.
 - Compare alternatives when appropriate.
 - Clearly distinguish verified facts from assumptions.
@@ -105,20 +108,12 @@ async def researcher_agent(user_request: str) -> str:
 async def main():
     result = await researcher_agent(
         """
-    Research the best approach for securely executing AI-generated
-    Python, Java, C, and C++ code.
-
-    Compare:
-    - direct local execution
-    - subprocess isolation
-    - E2B
-    - container-based sandboxing
-
-    Consider security, portability, cost, resource isolation,
-    and suitability for a multi-user coding-agent platform.
+    Inspect the workspace and identify missing technical or contextual information
+    needed for the available project requirements. Research relevant questions and
+    compare approaches where useful. If the goal is unclear, report the missing context.
 
     Do not implement anything.
-    Recommend the best architecture and provide sources.
+    Provide supported findings, recommendations, and sources.
     """
     )
 

@@ -7,19 +7,19 @@ from mcp_registry import get_mcp_tools
 WORKSPACE_DIR = r"C:\Users\perur\Desktop\workspace"
 
 ROLE = """
-You are an expert Python Software Engineer. You write clean, modular, and maintainable Python code strictly tailored to user requirements.
+You are an expert Software Engineer. You implement and fix clean, maintainable solutions using the languages, frameworks, architecture, and tooling required by the task and project.
 """
 
 INSTRUCTIONS = f"""
-1. Review the user prompt and determine the required source code file name and logic.
-2. Use the workspace filesystem tools to write the complete implementation into the root directory: {WORKSPACE_DIR}.
-3. Include proper type hints, comprehensive docstrings, and explicit input validation (raising ValueError or TypeError where applicable).
-4. Conclude with a concise summary confirming the exact file path created.
+1. Inspect the request, supplied orchestrator context and prior outputs, workspace contents, and available tools to determine requirements and project conventions.
+2. Use the available tools to implement or fix the required files within {WORKSPACE_DIR}, following the project structure rather than assuming root-level files.
+3. Follow the project's language and framework conventions for types, documentation, validation, and error handling where appropriate. Preserve working behavior outside the requested changes.
+4. Conclude with a concise summary of changes and exact file paths created or modified.
 """
 
 CONTEXT = f"""
 - Target workspace directory: {WORKSPACE_DIR}
-- Do not place unit tests here; this agent only generates production/source code.
+- Focus on implementation and fixes; leave test-suite authoring and validation to the Tester.
 - Write files using the filesystem tools provided via GoModel.
 """
 
@@ -57,22 +57,3 @@ CONTEXT:
 
     finally:
         await adapter.__aexit__(None, None, None)
-
-
-async def main():
-    result = await coder_agent(
-        """
-Create factorial.py containing a function `calculate_factorial(n: int) -> int`.
-Requirements:
-- Validate that `n` is an integer (raise TypeError if not).
-- Validate that `n >= 0` (raise ValueError if negative).
-- Return 1 for n=0 and n=1.
-- Accurately calculate the factorial for positive integers.
-Save the file directly in the workspace root.
-"""
-    )
-    print(result)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())

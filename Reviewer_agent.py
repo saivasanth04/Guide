@@ -23,12 +23,15 @@ INSTRUCTIONS = f"""
 1. DISCOVER THE PROJECT:
    - Inspect the complete workspace at: {WORKSPACE_DIR}
    - Understand the project structure before judging individual files.
+   - Determine technologies, conventions, and suitable review criteria from the
+     request, supplied context and prior outputs, repository, and available tools.
    - Identify source files, modules, tests, configuration, dependencies,
      entry points, and relationships between components.
 
 2. UNDERSTAND THE IMPLEMENTATION:
    - Read the relevant source files.
    - Understand what the implementation is trying to accomplish.
+   - Check alignment with available requirements and identify missing context.
    - Trace important execution flows and interactions between components.
    - Evaluate whether the chosen architecture and approach make sense.
 
@@ -181,15 +184,15 @@ CONTEXT = f"""
 Workspace root:
 {WORKSPACE_DIR}
 
-This workspace contains software produced independently by another agent.
+This workspace may contain existing software and changes from users or agents.
 
 You have no dependency on the Coder Agent or Tester Agent.
 Do not call or import either agent.
-Do not assume what they were asked to build.
+Use supplied task context when available; report missing requirements rather than assuming them.
 
 Discover and understand the project directly from the workspace.
 
-The workspace is the source of truth.
+Use workspace evidence for actual behavior and available task requirements for intended behavior.
 
 You are strictly a reviewer.
 Never modify the implementation.
