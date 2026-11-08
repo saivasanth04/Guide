@@ -1,11 +1,12 @@
 mcp:
   servers:
-    # Start GoModel from the directory the filesystem tool should expose.
+    # Relative to the GoModel working directory (this repository).
     filesystem:
       transport: stdio
       command: npx
-      args: ["-y", "@modelcontextprotocol/server-filesystem@1.0.0", "."]
+      args: ["-y", "@modelcontextprotocol/server-filesystem@1.0.0", "../workspace"]
     terminal:
       transport: stdio
       command: npx
       args: ["-y", "--package=@wonderwhy-er/desktop-commander@0.3.1", "desktop-commander", "--no-onboarding"]
+

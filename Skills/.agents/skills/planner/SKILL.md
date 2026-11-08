@@ -29,10 +29,7 @@ Create detailed, phased implementation plans for bugs, features, or tasks.
 
 ### Phase 1: Clarify Requirements
 
-Before doing ANY documentation search: clarify requirements with user.
-This will narrow and aid you in finding the right docs.
-
-Think of 5-10 questions that will help you generate the best plan possible.
+After investigating, ask one batch of questions only if essential requirements remain unclear. Otherwise continue.
 
 Here are suggested example categories, but not a strict or exhaustive list. You may ask anything helpful. Use best judgement & prioritize ambiguity and risk reduction:
 1. Goals & success criteria
@@ -94,7 +91,7 @@ Examples:
 
 AFTER it is saved. Identify potential issues & edge cases in plan. Address proactively. Where could smth go wrong? What about the plan is ambiguous? Missing step, dependency, or pitfall?
 
-If any gotchas found, stop & ask up to 3 more questions. (either w/ request_user_input or directly)
+Ask a final batch of up to three questions only if unresolved risks require user input.
 
 Refine the plan if any additional useful info is provided.
 

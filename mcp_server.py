@@ -15,4 +15,8 @@ async def gateway_tools(base_url, api_key=None):
         "headers": {"Authorization": f"Bearer {api_key}"} if api_key else {},
     }})
     async with client.session("gomodel") as session:
-        yield await load_mcp_tools(session)
+        tools = await load_mcp_tools(session)
+        print(f"[Loaded MCP Tools from {url}]: {[tool.name for tool in tools]}", flush=True)
+        if not tools:
+            raise RuntimeError(f"{url} returned no tools. Check GoModel's config.yaml, caller access, and upstream initialization logs.")
+        yield tools

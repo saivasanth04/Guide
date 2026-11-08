@@ -2,10 +2,17 @@
 
 import asyncio
 import os
+import re
+from pathlib import Path
 from uuid import uuid4
 
 from langchain.agents import create_agent
+from langchain.agents.middleware import wrap_tool_call
 from langchain.chat_models import init_chat_model
+from langchain_core.messages import ToolMessage
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command, interrupt
+
 from mcp_server import gateway_tools
 from skills import SkillManager
 
@@ -35,26 +42,81 @@ async def run_agent(task, tools, planner_skill, base_url, key):
         max_retries=1,
     )
     system_prompt = (
-        "You are a software planning agent. Create and validate plans without implementing them. "
+        "You are a software planning agent. Create plans without implementing them. "
         "Follow the skill below. Use relevant tools to ground the plan in the user's context. "
         "Avoid accessing secrets and identify assumptions or missing evidence.\n\n"
         f"INSTRUCTIONS FROM SKILL.MD:\n{planner_skill['instructions']}"
     )
-    agent = create_agent(model=model, tools=tools, system_prompt=system_prompt)
-    print(f"[Loaded MCP Tools]: {[tool.name for tool in tools]}", flush=True)
-    print(f"[Starting Agent Task]: {task}\n", flush=True)
-    response = await agent.ainvoke(
-        {"messages": [("user", f"Working directory: {WORK_DIR}\n\n{task}")]}, {"recursion_limit": 30}
+    def clarify(questions: str) -> str:
+        """Ask the user a batch of essential questions and wait for their answers."""
+        return interrupt(questions)
+
+    saved = {}
+
+    def save_plan(filename: str, markdown: str) -> str:
+        """Save or revise the finished Markdown plan in the working directory."""
+        if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*-plan\.md", filename) or not markdown.strip():
+            raise ValueError("Supply a kebab-case -plan.md filename and nonempty Markdown.")
+        path = Path(WORK_DIR) / filename
+        if path.exists() and path not in saved:
+            path = path.with_name(f"{path.stem.removesuffix('-plan')}-{session_id[-8:]}-plan.md")
+        with path.open("w" if path in saved else "x", encoding="utf-8") as output:
+            output.write(markdown)
+        saved[path] = markdown
+        return str(path)
+
+    names = {tool.name for tool in tools}
+
+    @wrap_tool_call
+    async def report_tool(request, handler):
+        result = await handler(request)
+        if isinstance(result, ToolMessage) and request.tool_call["name"] in names:
+            print(f"[MCP {result.status}] {request.tool_call['name']}", flush=True)
+            if result.status == "error":
+                print(result.content, flush=True)
+            if isinstance(result.content, list):
+                blocks = [b for b in result.content if not (
+                    isinstance(b, dict) and b.get("type") == "text" and not b.get("text")
+                )]
+                result = result.model_copy(update={"content": blocks or "(Tool returned no content.)"})
+        return result
+
+    agent = create_agent(
+        model=model, tools=[*tools, clarify, save_plan], checkpointer=InMemorySaver(), middleware=[report_tool],
+        system_prompt=system_prompt + "\nUse MCP tools to investigate the workspace. "
+        "Use clarify for essential questions and save_plan for all plan writes. "
+        "Report failed or unavailable research.",
     )
-    if not response["messages"][-1].content:
-        response = await agent.ainvoke(
-            {"messages": [*response["messages"], ("user", "Your response was empty. Please provide your findings or clarification questions in text.")]},
-            {"recursion_limit": 30},
-        )
-    if not response["messages"][-1].content:
-        raise RuntimeError("GoModel returned an empty final response twice; check the selected model and gateway logs")
-    print("\n--- Final Planner Output ---")
-    print(response["messages"][-1].content)
+    config = {"configurable": {"thread_id": session_id}, "recursion_limit": 80}
+    request = {"messages": [("user", f"Working directory: {WORK_DIR}\n\n{task}")]}
+    rounds = 0
+    for _ in range(8):
+        result = await agent.ainvoke(request, config)
+        if pending := result.get("__interrupt__"):
+            answers = {}
+            for item in pending:
+                if rounds >= 2:
+                    answers[item.id] = "Clarification limit reached. Proceed with stated assumptions."
+                    continue
+                print(item.value, flush=True)
+                answer = await asyncio.to_thread(input, "Answer (/cancel to exit): ")
+                if answer.strip().lower() == "/cancel":
+                    print("Planning cancelled.")
+                    return
+                answers[item.id] = answer
+                rounds += 1
+            request = Command(resume=answers)
+            continue
+        calls = [m for m in result["messages"] if isinstance(m, ToolMessage) and m.name in names]
+        if any(m.status == "success" for m in calls) and saved:
+            path = next(reversed(saved))
+            if path.read_text(encoding="utf-8") != saved[path]:
+                raise RuntimeError(f"Saved plan failed verification: {path}")
+            print(result["messages"][-1].content)
+            print(f"Verified plan: {path}")
+            return
+        request = {"messages": [("user", "Continue the same task. Investigate with MCP and save the plan using save_plan. Use clarify if blocked on user input.")]}
+    raise RuntimeError("Planner exhausted its continuation budget without completing the workflow.")
 
 
 if __name__ == "__main__":
