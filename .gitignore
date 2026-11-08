@@ -16,3 +16,4 @@ dist/
 artifacts/
 
 .shell-mcp/node_modules/
+*.log
