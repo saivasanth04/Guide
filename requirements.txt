@@ -4,3 +4,4 @@ langchain-mcp-adapters==0.3.2
 # The adapter imports RequestContext from the MCP 1.x API.
 mcp>=1.9.2,<2
 PyYAML==6.0.3
+langgraph-checkpoint-sqlite==3.1.3

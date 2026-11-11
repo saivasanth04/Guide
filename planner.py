@@ -1,123 +1,131 @@
-"""Run the planner skill with tools supplied by MCP servers."""
+"""Run a planning task, or resume its checkpoint with PLANNER_THREAD."""
 
 import asyncio
+import hashlib
 import os
 import re
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from uuid import uuid4
 
 from langchain.agents import create_agent
-from langchain.agents.middleware import wrap_tool_call
+from langchain.agents.structured_output import ToolStrategy
 from langchain.chat_models import init_chat_model
-from langchain_core.messages import ToolMessage
-from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command, interrupt
+from typing_extensions import TypedDict, Annotated
 
 from mcp_server import gateway_tools
 from skills import SkillManager
 
-WORK_DIR = r"C:\Users\perur\Desktop\workspace"
-TASK_GOAL = "Create a phased implementation plan for adding dynamic rate-limiting to our API."
+
+WORK_DIR = Path(r"C:\Users\perur\Desktop\workspace")
 
 
-async def main(task):
-    os.chdir(WORK_DIR)
-    planner_skill = SkillManager().load_skill("planner")
-    base_url = os.environ.get("GOMODEL_BASE_URL", "http://localhost:8080/v1")
-    key = os.environ.get("GOMODEL_MASTER_KEY")
-    async with gateway_tools(base_url, key) as tools:
-        await run_agent(task, tools, planner_skill, base_url, key)
+class Plan(TypedDict):
+    """Final validated planning artifact, including verification steps and remaining risks."""
+
+    filename: Annotated[str, "A kebab-case filename ending in -plan.md"]
+    markdown: Annotated[str, "The complete Markdown plan following the supplied skill"]
 
 
-async def run_agent(task, tools, planner_skill, base_url, key):
-    session_id = f"planner-{uuid4()}"
-    model = init_chat_model(
-        model=os.environ.get("GOMODEL_MODEL", "router"),
-        model_provider="openai",
-        base_url=base_url,
-        api_key=key or "dummy-key",
-        default_headers={"X-Session-ID": session_id, "x-session-affinity": session_id},
-        temperature=0.2,
-        timeout=120,
-        max_retries=1,
-    )
-    system_prompt = (
-        "You are a software planning agent. Create plans without implementing them. "
-        "Follow the skill below. Use relevant tools to ground the plan in the user's context. "
-        "Avoid accessing secrets and identify assumptions or missing evidence.\n\n"
-        f"INSTRUCTIONS FROM SKILL.MD:\n{planner_skill['instructions']}"
-    )
-    def clarify(questions: str) -> str:
-        """Ask the user a batch of essential questions and wait for their answers."""
-        return interrupt(questions)
+def clarify(questions: str) -> str:
+    """Ask essential clarification questions together and await the user's answer."""
+    return interrupt(questions)
 
-    saved = {}
 
-    def save_plan(filename: str, markdown: str) -> str:
-        """Save or revise the finished Markdown plan in the working directory."""
-        if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*-plan\.md", filename) or not markdown.strip():
-            raise ValueError("Supply a kebab-case -plan.md filename and nonempty Markdown.")
-        path = Path(WORK_DIR) / filename
-        if path.exists() and path not in saved:
-            path = path.with_name(f"{path.stem.removesuffix('-plan')}-{session_id[-8:]}-plan.md")
-        with path.open("w" if path in saved else "x", encoding="utf-8") as output:
-            output.write(markdown)
-        saved[path] = markdown
-        return str(path)
+def publish(workspace, plan):
+    filename, markdown = plan["filename"], plan["markdown"]
+    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*-plan\.md", filename):
+        raise ValueError(f"Invalid plan filename: {filename!r}")
+    if not re.search(r"^# .+\n", markdown, re.M) or not re.search(r"^## .+", markdown, re.M):
+        raise ValueError("Expected a Markdown plan with a title and sections.")
+    data = markdown.encode("utf-8")
+    path = workspace / filename
+    with NamedTemporaryFile(dir=workspace, delete=False) as temp:
+        staging = Path(temp.name)
+    try:
+        staging.write_bytes(data)
+        try:
+            os.link(staging, path)
+        except FileExistsError:
+            if path.is_symlink() or path.read_bytes() != data:
+                path = path.with_name(f"{path.stem.removesuffix('-plan')}-{hashlib.sha256(data).hexdigest()[:16]}-plan.md")
+                try:
+                    os.link(staging, path)
+                except FileExistsError:
+                    pass
+        if path.is_symlink() or path.read_bytes() != data:
+            raise RuntimeError(f"Plan publication conflict: {path}")
+        return path
+    finally:
+        staging.unlink(missing_ok=True)
 
-    names = {tool.name for tool in tools}
 
-    @wrap_tool_call
-    async def report_tool(request, handler):
-        result = await handler(request)
-        if isinstance(result, ToolMessage) and request.tool_call["name"] in names:
-            print(f"[MCP {result.status}] {request.tool_call['name']}", flush=True)
-            if result.status == "error":
-                print(result.content, flush=True)
-            if isinstance(result.content, list):
-                blocks = [b for b in result.content if not (
-                    isinstance(b, dict) and b.get("type") == "text" and not b.get("text")
-                )]
-                result = result.model_copy(update={"content": blocks or "(Tool returned no content.)"})
-        return result
-
-    agent = create_agent(
-        model=model, tools=[*tools, clarify, save_plan], checkpointer=InMemorySaver(), middleware=[report_tool],
-        system_prompt=system_prompt + "\nUse MCP tools to investigate the workspace. "
-        "Use clarify for essential questions and save_plan for all plan writes. "
-        "Report failed or unavailable research.",
-    )
-    config = {"configurable": {"thread_id": session_id}, "recursion_limit": 80}
-    request = {"messages": [("user", f"Working directory: {WORK_DIR}\n\n{task}")]}
-    rounds = 0
-    for _ in range(8):
-        result = await agent.ainvoke(request, config)
-        if pending := result.get("__interrupt__"):
-            answers = {}
-            for item in pending:
-                if rounds >= 2:
-                    answers[item.id] = "Clarification limit reached. Proceed with stated assumptions."
-                    continue
-                print(item.value, flush=True)
-                answer = await asyncio.to_thread(input, "Answer (/cancel to exit): ")
-                if answer.strip().lower() == "/cancel":
-                    print("Planning cancelled.")
-                    return
-                answers[item.id] = answer
-                rounds += 1
-            request = Command(resume=answers)
-            continue
-        calls = [m for m in result["messages"] if isinstance(m, ToolMessage) and m.name in names]
-        if any(m.status == "success" for m in calls) and saved:
-            path = next(reversed(saved))
-            if path.read_text(encoding="utf-8") != saved[path]:
-                raise RuntimeError(f"Saved plan failed verification: {path}")
-            print(result["messages"][-1].content)
-            print(f"Verified plan: {path}")
+async def main(task=None):
+    workspace = WORK_DIR.resolve(strict=True)
+    if not workspace.is_dir():
+        raise NotADirectoryError(workspace)
+    thread = os.environ.get("PLANNER_THREAD") or str(uuid4())
+    config = {"configurable": {"thread_id": thread}}
+    print(f"Workspace: {workspace}\nResume with PLANNER_THREAD={thread}", flush=True)
+    # Separate workspace histories and keep checkpoints outside the investigated tree.
+    scope = hashlib.sha256(os.fsencode(str(workspace))).hexdigest()[:16]
+    db = Path.home() / ".guide-planner" / f"{scope}.sqlite3"
+    db.parent.mkdir(exist_ok=True)
+    async with AsyncSqliteSaver.from_conn_string(str(db)) as checkpoints:
+        checkpoint = await checkpoints.aget_tuple(config)
+        if not checkpoint and os.environ.get("PLANNER_THREAD"):
+            raise ValueError("Unknown planner thread for this workspace.")
+        if checkpoint and (plan := checkpoint.checkpoint["channel_values"].get("structured_response")):
+            print(f"Verified plan: {publish(workspace, plan)}")
             return
-        request = {"messages": [("user", "Continue the same task. Investigate with MCP and save the plan using save_plan. Use clarify if blocked on user input.")]}
-    raise RuntimeError("Planner exhausted its continuation budget without completing the workflow.")
+        base_url = os.environ.get("GOMODEL_BASE_URL", "http://localhost:8080/v1")
+        key = os.environ.get("GOMODEL_MASTER_KEY")
+        model = init_chat_model(
+            model=os.environ.get("GOMODEL_MODEL", "router"), model_provider="openai",
+            base_url=base_url, api_key=key or "dummy-key", timeout=120, max_retries=0,
+            default_headers={"X-Session-ID": thread, "x-session-affinity": thread},
+            temperature=0.2,
+        )
+        skill = SkillManager().load_skill("planner")
+        async with gateway_tools(base_url, key) as tools:
+            agent = create_agent(
+                model, tools=[*tools, clarify], response_format=ToolStrategy(Plan),
+                checkpointer=checkpoints,
+                system_prompt="Investigate the supplied workspace using read-only operations. "
+                "Ask essential questions via clarify. Report unavailable evidence and avoid secrets. "
+                "Follow the planning skill. Validate your plan and return the complete final artifact "
+                "as the structured response. The application saves it. Never implement changes.\n\n"
+                + skill["instructions"],
+            )
+            state = await agent.aget_state(config)
+            request = None
+            if not checkpoint:
+                task = task or os.environ.get("PLANNER_TASK") or input("Planning request: ")
+                if not task.strip():
+                    raise ValueError("A planning request is required.")
+                request = {"messages": [("user", f"Workspace: {workspace}\n\n{task}")]}
+            while True:
+                if state.interrupts:
+                    answers = {}
+                    for item in state.interrupts:
+                        print(item.value, flush=True)
+                        answer = await asyncio.to_thread(input, "Answer (/pause to exit): ")
+                        if answer.strip() in {"/pause", "/cancel"}:
+                            return
+                        if not answer.strip():
+                            raise ValueError("An answer is required. Resume the thread to continue.")
+                        answers[item.id] = answer
+                    request = Command(resume=answers)
+                result = await agent.ainvoke(request, config, durability="sync")
+                state = await agent.aget_state(config)
+                if not state.interrupts:
+                    if not (plan := result.get("structured_response")):
+                        raise RuntimeError("Agent ended without a final plan.")
+                    print(f"Verified plan: {publish(workspace, plan)}")
+                    return
 
 
 if __name__ == "__main__":
-    asyncio.run(main(TASK_GOAL))
+    asyncio.run(main())
