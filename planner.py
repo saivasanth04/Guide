@@ -1,5 +1,3 @@
-"""Run a planning task, or resume its checkpoint with PLANNER_THREAD."""
-
 import asyncio
 import hashlib
 import os
@@ -9,11 +7,13 @@ from tempfile import NamedTemporaryFile
 from uuid import uuid4
 
 from langchain.agents import create_agent
+from langchain.agents.middleware import HumanInTheLoopMiddleware
 from langchain.agents.structured_output import ToolStrategy
 from langchain.chat_models import init_chat_model
+from langchain.tools import tool
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-from langgraph.types import Command, interrupt
-from typing_extensions import TypedDict, Annotated
+from langgraph.types import Command
+from typing_extensions import Annotated, TypedDict
 
 from mcp_server import gateway_tools
 from skills import SkillManager
@@ -29,9 +29,11 @@ class Plan(TypedDict):
     markdown: Annotated[str, "The complete Markdown plan following the supplied skill"]
 
 
-def clarify(questions: str) -> str:
-    """Ask essential clarification questions together and await the user's answer."""
-    return interrupt(questions)
+@tool
+def ask_user(questions: str) -> str:
+    """Ask essential questions together; ask again if the answer leaves a blocker."""
+    # HumanInTheLoopMiddleware supplies the answer without executing this tool.
+    raise RuntimeError("ask_user requires a human response through HITL middleware.")
 
 
 def publish(workspace, plan):
@@ -91,15 +93,20 @@ async def main(task=None):
         skill = SkillManager().load_skill("planner")
         async with gateway_tools(base_url, key) as tools:
             agent = create_agent(
-                model, tools=[*tools, clarify], response_format=ToolStrategy(Plan),
+                model, tools=[*tools, ask_user], response_format=ToolStrategy(Plan),
+                middleware=[HumanInTheLoopMiddleware(
+                    interrupt_on={"ask_user": {"allowed_decisions": ["respond"]}},
+                    interrupt_mode="per_call",
+                )],
                 checkpointer=checkpoints,
                 system_prompt="Investigate the supplied workspace using read-only operations. "
-                "Ask essential questions via clarify. Report unavailable evidence and avoid secrets. "
+                "Ask essential questions via ask_user whenever missing information blocks progress, "
+                "including after earlier answers. Report unavailable evidence and avoid secrets. "
                 "Follow the planning skill. Validate your plan and return the complete final artifact "
                 "as the structured response. The application saves it. Never implement changes.\n\n"
                 + skill["instructions"],
             )
-            state = await agent.aget_state(config)
+            interrupts = (await agent.aget_state(config)).interrupts if checkpoint else ()
             request = None
             if not checkpoint:
                 task = task or os.environ.get("PLANNER_TASK") or input("Planning request: ")
@@ -107,20 +114,26 @@ async def main(task=None):
                     raise ValueError("A planning request is required.")
                 request = {"messages": [("user", f"Workspace: {workspace}\n\n{task}")]}
             while True:
-                if state.interrupts:
+                if interrupts:
                     answers = {}
-                    for item in state.interrupts:
-                        print(item.value, flush=True)
+                    for item in interrupts:
+                        if not isinstance(item.value, dict) or item.value.get("name") != "ask_user":
+                            raise ValueError(
+                                "This checkpoint uses an incompatible human-input protocol. "
+                                "Finish it with the original planner version, or unset "
+                                "PLANNER_THREAD to start a new task."
+                            )
+                        print(item.value["args"]["questions"], flush=True)
                         answer = await asyncio.to_thread(input, "Answer (/pause to exit): ")
                         if answer.strip() in {"/pause", "/cancel"}:
                             return
                         if not answer.strip():
                             raise ValueError("An answer is required. Resume the thread to continue.")
-                        answers[item.id] = answer
+                        answers[item.id] = {"type": "respond", "message": answer}
                     request = Command(resume=answers)
                 result = await agent.ainvoke(request, config, durability="sync")
-                state = await agent.aget_state(config)
-                if not state.interrupts:
+                interrupts = result.get("__interrupt__", ())
+                if not interrupts:
                     if not (plan := result.get("structured_response")):
                         raise RuntimeError("Agent ended without a final plan.")
                     print(f"Verified plan: {publish(workspace, plan)}")
