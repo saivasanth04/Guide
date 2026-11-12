@@ -6,6 +6,24 @@
       "sourceType": "github",
       "skillPath": "skills/planner/SKILL.md",
       "computedHash": "57039ddee98a01559317ae43d0638cf2cdc3e638a3eac09341bf0964ad211240"
+    },
+    "researcher": {
+      "source": "bytedance/deer-flow",
+      "sourceType": "github",
+      "ref": "aaca3eeaebaafe7c4ca0147f83e9738655a39b2d",
+      "skillPath": "skills/public/deep-research/SKILL.md",
+      "contentSha256": "f15a324d9c648a44262b2dcdc6089d2db4975126beebb3d322c6b4e18d2e85e2",
+      "upstreamContentSha256": "33982d487a0b3ef92733469cabe96f6a6256b93e4c1fcbf2e01ab33e308d8b42",
+      "adaptation": "Frontmatter name aliased to local role; instruction body unchanged."
+    },
+    "coder": {
+      "source": "github/awesome-copilot",
+      "sourceType": "github",
+      "ref": "30a0d7465b14b05e05949d6588b99f7af0c537b4",
+      "skillPath": "skills/quasi-coder/SKILL.md",
+      "contentSha256": "5bd225b43ce82a866b25477d11df02fa8ad35305afa66d56ebb878ec6d9f9dce",
+      "upstreamContentSha256": "5bd225b43ce82a866b25477d11df02fa8ad35305afa66d56ebb878ec6d9f9dce",
+      "adaptation": "None; upstream file preserved byte-for-byte in the local coder role directory."
     }
   }
 }

@@ -2,9 +2,9 @@
 
 from contextlib import asynccontextmanager
 
-from mcp.types import TextContent
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.tools import load_mcp_tools
+from mcp.types import TextContent
 
 
 @asynccontextmanager
@@ -13,7 +13,10 @@ async def gateway_tools(base_url, api_key=None):
     client = MultiServerMCPClient({"gomodel": {
         "transport": "streamable_http",
         "url": url,
-        "headers": {"Authorization": f"Bearer {api_key}"} if api_key else {},
+        # Tool-level policy needs original names and annotations, not an opaque
+        # gateway call_tool dispatcher. Discovery and invocation still use GoModel.
+        "headers": {"X-MCP-Tool-Discovery": "off",
+                    **({"Authorization": f"Bearer {api_key}"} if api_key else {})},
     }})
     async with client.session("gomodel") as session:
         tools = await load_mcp_tools(session, tool_interceptors=[report_tool])
@@ -26,8 +29,6 @@ async def gateway_tools(base_url, api_key=None):
 async def report_tool(request, handler):
     result = await handler(request)
     print(f"[MCP {'error' if result.isError else 'success'}] {request.name}", flush=True)
-    if result.isError:
-        print(result.content, flush=True)
     # The chat route rejects empty text blocks (e.g. an empty directory listing).
     blocks = [b for b in result.content if not isinstance(b, TextContent) or b.text]
     if len(blocks) != len(result.content):

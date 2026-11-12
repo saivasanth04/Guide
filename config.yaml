@@ -7,8 +7,23 @@ mcp:
         - "-y"
         - "@modelcontextprotocol/server-filesystem@1.0.0"
         - 'C:\Users\perur\Desktop\workspace'
+        - 'C:\Users\perur\Desktop\NTG'
     terminal:
       transport: stdio
       command: npx
       args: ["-y", "--package=@wonderwhy-er/desktop-commander@0.3.1", "desktop-commander", "--no-onboarding"]
+    web:
+      transport: stdio
+      command: uv
+      args: ["tool", "run", "--from", "duckduckgo-mcp-server[browser]==0.7.0", "duckduckgo-mcp-server"]
+      allowed_tools: ["search", "fetch_content", "expand_link"]
+      tool_timeout: 90s
+      # GoModel intentionally strips the inherited environment. uv needs a
+      # writable Windows temp/cache location; no provider credentials are passed.
+      env:
+        TEMP: '${TEMP}'
+        TMP: '${TMP}'
+        USERPROFILE: '${USERPROFILE}'
+        LOCALAPPDATA: '${LOCALAPPDATA}'
+        SYSTEMROOT: '${SYSTEMROOT}'
 

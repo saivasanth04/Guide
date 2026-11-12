@@ -1,23 +1,26 @@
 import asyncio
 import hashlib
+import math
 import os
-import re
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from uuid import uuid4
 
+from dotenv import load_dotenv
 from langchain.agents import create_agent
 from langchain.agents.middleware import HumanInTheLoopMiddleware
 from langchain.agents.structured_output import ToolStrategy
 from langchain.chat_models import init_chat_model
-from langchain.tools import tool
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
 from typing_extensions import Annotated, TypedDict
 
+from contracts import Blocked, DevelopmentPlan, ResearchRequest
+from contracts import validate_plan as validate_plan
 from mcp_server import gateway_tools
-from skills import SkillManager
-
+from skills import SkillManager, runtime_instructions
+from tool_policy import WorkspaceGuard, select_tools, worker_policy
+from tool_policy import ask_user as ask_user
 
 WORK_DIR = Path(r"C:\Users\perur\Desktop\workspace")
 
@@ -29,19 +32,71 @@ class Plan(TypedDict):
     markdown: Annotated[str, "The complete Markdown plan following the supplied skill"]
 
 
-@tool
-def ask_user(questions: str) -> str:
-    """Ask essential questions together; ask again if the answer leaves a blocker."""
-    # HumanInTheLoopMiddleware supplies the answer without executing this tool.
-    raise RuntimeError("ask_user requires a human response through HITL middleware.")
+def create_model(thread):
+    """Use the existing GoModel route and keep provider credentials in the gateway."""
+    timeout = float(os.environ.get("GOMODEL_TIMEOUT", "300"))
+    retries = int(os.environ.get("GOMODEL_MAX_RETRIES", "2"))
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("GOMODEL_TIMEOUT must be a positive, finite number of seconds.")
+    if not 0 <= retries <= 5:
+        raise ValueError("GOMODEL_MAX_RETRIES must be an integer between 0 and 5.")
+    return init_chat_model(
+        model=os.environ.get("GOMODEL_MODEL", "router"), model_provider="openai",
+        base_url=os.environ.get("GOMODEL_BASE_URL", "http://localhost:8080/v1"),
+        api_key=os.environ.get("GOMODEL_MASTER_KEY") or "dummy-key",
+        timeout=timeout, max_retries=retries, temperature=0.2,
+        default_headers={"X-Session-ID": thread, "x-session-affinity": thread},
+    )
+
+
+def create_planner(model, tools, *, checkpointer=None, response_schema=None,
+                   middleware=(), instructions="", workspace=None,
+                   approved_commands=(), model_call_limit=24):
+    """Reuse the Planner in standalone mode or as a checkpointed worker subgraph."""
+    if workspace is not None:
+        workspace = Path(workspace).resolve(strict=True)
+        tools, policy = worker_policy(
+            tools, "planner", workspace, approved_commands=approved_commands,
+            model_call_limit=model_call_limit, include_questions=False,
+        )
+        middleware = [*policy, *middleware]
+        response_schema = response_schema or DevelopmentPlan | ResearchRequest | Blocked
+        instructions += runtime_instructions(workspace) + (
+            "\nReturn ResearchRequest if additional investigation is "
+            "needed; the Researcher will return evidence. Delegate substantial external "
+            "research instead of duplicating the Researcher. If the user explicitly "
+            "requests Researcher collaboration during planning, return ResearchRequest "
+            "before finalizing the plan, even if you could research it yourself. "
+            "Otherwise return DevelopmentPlan "
+            "with concrete executable verification commands and the skill's Markdown plan. "
+            "The workflow saves its plan outside the project workspace. Inspect "
+            "existing workspace contents before choosing a scaffolding destination; "
+            "use the root only if empty, or a new empty project subdirectory. "
+            "If impossible, return Blocked. Do not produce a speculative plan."
+        )
+    response_schema = response_schema or Plan
+    skill = SkillManager().load_skill("planner")
+    return create_agent(
+        model, tools=[*tools, ask_user], response_format=ToolStrategy(response_schema),
+        middleware=[HumanInTheLoopMiddleware(
+            interrupt_on={"ask_user": {"allowed_decisions": ["respond"]}},
+            interrupt_mode="per_call",
+        ), *middleware],
+        checkpointer=checkpointer,
+        system_prompt="Investigate the supplied workspace using read-only operations. "
+        "Ask essential questions via ask_user whenever missing information blocks progress, "
+        "including after earlier answers. Report unavailable evidence and avoid secrets. "
+        "Follow the planning skill. Never implement changes.\n\n" + skill["instructions"]
+        + "\n\nApplication contract: return the complete final artifact as the structured "
+        "response; the application saves it. Do not save files yourself. If Context7 is "
+        "unavailable, use the available official documentation retrieval tools or report "
+        "the evidence gap.\n" + instructions,
+    )
 
 
 def publish(workspace, plan):
+    validate_plan(plan)
     filename, markdown = plan["filename"], plan["markdown"]
-    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*-plan\.md", filename):
-        raise ValueError(f"Invalid plan filename: {filename!r}")
-    if not re.search(r"^# .+\n", markdown, re.M) or not re.search(r"^## .+", markdown, re.M):
-        raise ValueError("Expected a Markdown plan with a title and sections.")
     data = markdown.encode("utf-8")
     path = workspace / filename
     with NamedTemporaryFile(dir=workspace, delete=False) as temp:
@@ -65,6 +120,7 @@ def publish(workspace, plan):
 
 
 async def main(task=None):
+    load_dotenv(Path(__file__).with_name(".env"))
     workspace = WORK_DIR.resolve(strict=True)
     if not workspace.is_dir():
         raise NotADirectoryError(workspace)
@@ -84,28 +140,11 @@ async def main(task=None):
             return
         base_url = os.environ.get("GOMODEL_BASE_URL", "http://localhost:8080/v1")
         key = os.environ.get("GOMODEL_MASTER_KEY")
-        model = init_chat_model(
-            model=os.environ.get("GOMODEL_MODEL", "router"), model_provider="openai",
-            base_url=base_url, api_key=key or "dummy-key", timeout=120, max_retries=0,
-            default_headers={"X-Session-ID": thread, "x-session-affinity": thread},
-            temperature=0.2,
-        )
-        skill = SkillManager().load_skill("planner")
+        model = create_model(thread)
         async with gateway_tools(base_url, key) as tools:
-            agent = create_agent(
-                model, tools=[*tools, ask_user], response_format=ToolStrategy(Plan),
-                middleware=[HumanInTheLoopMiddleware(
-                    interrupt_on={"ask_user": {"allowed_decisions": ["respond"]}},
-                    interrupt_mode="per_call",
-                )],
-                checkpointer=checkpoints,
-                system_prompt="Investigate the supplied workspace using read-only operations. "
-                "Ask essential questions via ask_user whenever missing information blocks progress, "
-                "including after earlier answers. Report unavailable evidence and avoid secrets. "
-                "Follow the planning skill. Validate your plan and return the complete final artifact "
-                "as the structured response. The application saves it. Never implement changes.\n\n"
-                + skill["instructions"],
-            )
+            allowed = select_tools(tools, "planner")
+            agent = create_planner(model, allowed, checkpointer=checkpoints,
+                                   middleware=[WorkspaceGuard(workspace, allowed)])
             interrupts = (await agent.aget_state(config)).interrupts if checkpoint else ()
             request = None
             if not checkpoint:
